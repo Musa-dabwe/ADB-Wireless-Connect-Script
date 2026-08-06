@@ -21,17 +21,28 @@ show_help() {
   echo "  -p, --port P          Specify target TCP port (default: 5555)"
   echo "  -h, --help            Show this help message"
   echo ""
-  exit 0
 }
 
 # Parse CLI flags
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     -n|--no-scrcpy) LAUNCH_SCRCPY=false; shift ;;
-    -a|--scrcpy-args) SCRCPY_ARGS="$2"; shift 2 ;;
-    -p|--port) PORT="$2"; shift 2 ;;
-    -h|--help) show_help ;;
-    *) echo -e "${YELLOW}[!] Unknown option: $1${NC}"; show_help ;;
+    -a|--scrcpy-args)
+      if [[ -z "$2" || "$2" =~ ^- ]]; then
+        echo -e "${YELLOW}[!] Option $1 requires an argument.${NC}"
+        show_help
+        exit 1
+      fi
+      SCRCPY_ARGS="$2"; shift 2 ;;
+    -p|--port)
+      if [[ -z "$2" || "$2" =~ ^- ]]; then
+        echo -e "${YELLOW}[!] Option $1 requires a port argument.${NC}"
+        show_help
+        exit 1
+      fi
+      PORT="$2"; shift 2 ;;
+    -h|--help) show_help; exit 0 ;;
+    *) echo -e "${YELLOW}[!] Unknown option: $1${NC}"; show_help; exit 1 ;;
   esac
 done
 
@@ -83,7 +94,7 @@ check_scrcpy() {
 
 detect_usb_device() {
   local devices
-  mapfile -t devices < <(adb devices | awk 'NR>1 && $2=="device" {print $1}')
+  mapfile -t devices < <(adb devices | awk 'NR>1 && $2=="device" && $1 !~ /:[0-9]+$/ {print $1}')
   
   if [[ ${#devices[@]} -eq 0 ]]; then
     echo ""
@@ -118,9 +129,9 @@ handle_android11_pairing() {
     adb pair "$pair_addr" "$pair_code"
     echo -e "${GREEN}[✓] Pairing successful!${NC}"
     echo ""
-    read -rp "  Enter target Connect Port shown on main Wireless Debugging page (e.g. 5555 or 42123): " target_port </dev/tty || target_port=5555
+    read -rp "  Enter target Connect Port shown on main Wireless Debugging page [default: $PORT]: " target_port </dev/tty || target_port="$PORT"
     DEVICE_IP="${pair_addr%%:*}"
-    PORT="${target_port:-5555}"
+    PORT="${target_port:-$PORT}"
   else
     echo -e "${YELLOW}[!] Pairing details missing. Exiting.${NC}"
     exit 1
@@ -131,17 +142,17 @@ step_get_ip() {
   echo -e "${YELLOW}[*] Extracting device IP address...${NC}"
   local ip=""
 
-  # Try rmnet_data0 first
-  ip=$(adb -s "$DEVICE_ID" shell ip addr show rmnet_data0 2>/dev/null | grep -oP 'inet \K[\d.]+' | head -n1 || true)
-
-  # Fallback to ip route destination
-  if [[ -z "$ip" ]]; then
-    ip=$(adb -s "$DEVICE_ID" shell "ip route get 1.1.1.1 2>/dev/null" | grep -oP 'src \K[\d.]+' | head -n1 || true)
-  fi
+  # Try ip route first (returns active Wi-Fi / hotspot route IP)
+  ip=$(adb -s "$DEVICE_ID" shell "ip route get 1.1.1.1 2>/dev/null" | grep -oP 'src \K[\d.]+' | head -n1 || true)
 
   # Fallback to wlan0 / wlan1 / ap0 / rndis0
   if [[ -z "$ip" ]]; then
-    ip=$(adb -s "$DEVICE_ID" shell ip addr 2>/dev/null | grep -oP 'inet \K[\d.]+' | grep -v '^127\.' | head -n1 || true)
+    ip=$(adb -s "$DEVICE_ID" shell ip addr 2>/dev/null | grep -oP 'inet \K[\d.]+' | grep -v '^127\.' | grep -v '^10\.' | head -n1 || true)
+  fi
+
+  # Fallback to rmnet_data0 (cellular)
+  if [[ -z "$ip" ]]; then
+    ip=$(adb -s "$DEVICE_ID" shell ip addr show rmnet_data0 2>/dev/null | grep -oP 'inet \K[\d.]+' | head -n1 || true)
   fi
 
   if [[ -z "$ip" ]]; then
@@ -192,9 +203,11 @@ step_disconnect_usb_prompt() {
   if adb devices | awk 'NR>1' | grep -q "$DEVICE_IP:$PORT"; then
     echo ""
     echo -e "${GREEN}  ✓ Connected wirelessly!${NC}"
+    return 0
   else
     echo ""
     echo -e "${YELLOW}  [!] Device not showing as connected wirelessly. Check the IP and try again.${NC}"
+    return 1
   fi
 }
 
@@ -235,7 +248,9 @@ main() {
     step_tcpip
     step_connect
     step_verify_wireless
-    step_disconnect_usb_prompt
+    if ! step_disconnect_usb_prompt; then
+      exit 1
+    fi
   else
     echo -e "${YELLOW}[!] No USB device detected.${NC}"
     read -rp "  Would you like to connect via Android 11+ Wireless Pairing mode? [Y/n]: " choice </dev/tty || choice="y"
