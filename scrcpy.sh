@@ -6,7 +6,7 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
-SCRCPY_ARGS=""
+SCRCPY_ARGS=()
 
 show_help() {
   echo -e "${CYAN}ADB Wireless Connect - scrcpy.sh${NC}"
@@ -16,7 +16,7 @@ show_help() {
   echo "Launch scrcpy for screen mirroring with custom resolution and FPS options."
   echo ""
   echo "Options:"
-  echo "  -a, --args S        Pass custom arguments to scrcpy (skips interactive prompts)"
+  echo "  -a, --args ...      Pass custom arguments to scrcpy (must be final option)"
   echo "  -s, --serial S      Specify device serial (e.g. 192.168.1.50:5555)"
   echo "  -h, --help          Show this help message"
   echo ""
@@ -27,13 +27,14 @@ DEVICE_SERIAL=""
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     -a|--args)
-      if [[ -z "$2" || "$2" =~ ^- ]]; then
-        echo -e "${YELLOW}[!] Option $1 requires an argument.${NC}"
+      shift
+      if [[ "$#" -eq 0 ]]; then
+        echo -e "${YELLOW}[!] Option --args requires at least one argument.${NC}"
         show_help
         exit 1
       fi
-      SCRCPY_ARGS="$2"
-      shift 2
+      SCRCPY_ARGS=("$@")
+      shift "$#"
       ;;
     -s|--serial)
       if [[ -z "$2" || "$2" =~ ^- ]]; then
@@ -76,6 +77,13 @@ check_scrcpy() {
 
 detect_device() {
   if [[ -n "$DEVICE_SERIAL" ]]; then
+    if ! adb devices | awk 'NR>1 && $2=="device" {print $1}' | grep -q "^${DEVICE_SERIAL}$"; then
+      echo -e "${YELLOW}[!] Specified device $DEVICE_SERIAL is not connected or not authorized.${NC}"
+      echo ""
+      echo "  Connected devices:"
+      adb devices | awk 'NR>1 && $2=="device" {print "    " $1}'
+      exit 1
+    fi
     echo -e "${GREEN}[✓] Using specified device: $DEVICE_SERIAL${NC}"
     return 0
   fi
@@ -116,9 +124,9 @@ prompt_resolution() {
   echo ""
   read -rp "  Select [1-4, default: 4]: " res_choice </dev/tty || res_choice="4"
   case "$res_choice" in
-    1) SCRCPY_ARGS+=" --max-size=1280" ;;
-    2) SCRCPY_ARGS+=" --max-size=800" ;;
-    3) SCRCPY_ARGS+=" --max-size=640" ;;
+    1) SCRCPY_ARGS+=("--max-size=1280") ;;
+    2) SCRCPY_ARGS+=("--max-size=800") ;;
+    3) SCRCPY_ARGS+=("--max-size=640") ;;
     *) ;; # no limit
   esac
 }
@@ -132,8 +140,8 @@ prompt_fps() {
   echo ""
   read -rp "  Select [1-3, default: 3]: " fps_choice </dev/tty || fps_choice="3"
   case "$fps_choice" in
-    1) SCRCPY_ARGS+=" --max-fps=60" ;;
-    2) SCRCPY_ARGS+=" --max-fps=30" ;;
+    1) SCRCPY_ARGS+=("--max-fps=60") ;;
+    2) SCRCPY_ARGS+=("--max-fps=30") ;;
     *) ;; # default
   esac
 }
@@ -154,11 +162,10 @@ show_shortcuts() {
 }
 
 launch_scrcpy() {
-  SCRCPY_ARGS="${SCRCPY_ARGS# }" # trim leading space
   echo -e "${YELLOW}[*] Launching scrcpy...${NC}"
-  if [[ -n "$SCRCPY_ARGS" ]]; then
-    echo -e "${CYAN}    Args: $SCRCPY_ARGS${NC}"
-    nohup scrcpy -s "$DEVICE_SERIAL" $SCRCPY_ARGS >/dev/null 2>&1 &
+  if [[ ${#SCRCPY_ARGS[@]} -gt 0 ]]; then
+    echo -e "${CYAN}    Args: ${SCRCPY_ARGS[*]}${NC}"
+    nohup scrcpy -s "$DEVICE_SERIAL" "${SCRCPY_ARGS[@]}" >/dev/null 2>&1 &
   else
     nohup scrcpy -s "$DEVICE_SERIAL" >/dev/null 2>&1 &
   fi
@@ -170,7 +177,7 @@ main() {
   check_scrcpy
   detect_device
 
-  if [[ -z "$SCRCPY_ARGS" ]]; then
+  if [[ ${#SCRCPY_ARGS[@]} -eq 0 ]]; then
     prompt_resolution
     prompt_fps
   fi

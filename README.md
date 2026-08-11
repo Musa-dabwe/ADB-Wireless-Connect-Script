@@ -101,7 +101,7 @@ The script will:
 ./scrcpy.sh [options]
 
 Options:
-  -a, --args S        Pass custom arguments to scrcpy (skips interactive prompts)
+  -a, --args ...     Pass custom arguments to scrcpy (must be final option, skips prompts)
   -s, --serial S      Specify device serial (e.g. 192.168.1.50:5555)
   -h, --help          Show help message
 ```
