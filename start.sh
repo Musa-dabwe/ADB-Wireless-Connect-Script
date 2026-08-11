@@ -7,7 +7,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 PORT=5555
-LAUNCH_SCRCPY=true
+SCRCPY_MODE="prompt" # Options: prompt, yes, no
 SCRCPY_ARGS=""
 
 show_help() {
@@ -16,6 +16,7 @@ show_help() {
   echo "Usage: ./start.sh [options]"
   echo ""
   echo "Options:"
+  echo "  -s, --scrcpy          Automatically launch scrcpy without prompting"
   echo "  -n, --no-scrcpy       Skip launching scrcpy screen mirroring"
   echo "  -a, --scrcpy-args S   Pass custom arguments to scrcpy (e.g. --scrcpy-args \"--turn-screen-off --stay-awake\")"
   echo "  -p, --port P          Specify target TCP port (default: 5555)"
@@ -26,14 +27,18 @@ show_help() {
 # Parse CLI flags
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
-    -n|--no-scrcpy) LAUNCH_SCRCPY=false; shift ;;
+    -s|--scrcpy) SCRCPY_MODE="yes"; shift ;;
+    -n|--no-scrcpy) SCRCPY_MODE="no"; shift ;;
     -a|--scrcpy-args)
       if [[ -z "$2" || "$2" =~ ^- ]]; then
         echo -e "${YELLOW}[!] Option $1 requires an argument.${NC}"
         show_help
         exit 1
       fi
-      SCRCPY_ARGS="$2"; shift 2 ;;
+      SCRCPY_ARGS="$2"
+      SCRCPY_MODE="yes"
+      shift 2
+      ;;
     -p|--port)
       if [[ -z "$2" || "$2" =~ ^- ]]; then
         echo -e "${YELLOW}[!] Option $1 requires a port argument.${NC}"
@@ -71,10 +76,20 @@ check_adb() {
   echo -e "${GREEN}[✓] adb detected${NC}"
 }
 
-check_scrcpy() {
-  if ! $LAUNCH_SCRCPY; then
-    return 1
+handle_scrcpy_option() {
+  if [[ "$SCRCPY_MODE" == "no" ]]; then
+    return 0
   fi
+
+  if [[ "$SCRCPY_MODE" == "prompt" ]]; then
+    echo ""
+    read -rp "  Would you like to launch scrcpy for screen mirroring? [y/N]: " choice </dev/tty || choice="n"
+    if [[ ! "$choice" =~ ^[Yy]$ ]]; then
+      echo -e "${YELLOW}[*] Skipping scrcpy launch.${NC}"
+      return 0
+    fi
+  fi
+
   if ! command -v scrcpy &>/dev/null; then
     echo ""
     echo -e "${YELLOW}[!] scrcpy not found. Install it:${NC}"
@@ -85,11 +100,13 @@ check_scrcpy() {
     read -rp "  Press Enter after installing scrcpy, or Ctrl+C to skip..." </dev/tty || true
     if ! command -v scrcpy &>/dev/null; then
       echo -e "${YELLOW}[!] scrcpy still not found. Skipping scrcpy launch.${NC}"
-      return 1
+      return 0
     fi
   fi
+
   echo -e "${GREEN}[✓] scrcpy detected${NC}"
-  return 0
+  step_show_shortcuts
+  step_launch_scrcpy
 }
 
 detect_usb_device() {
@@ -126,7 +143,13 @@ handle_android11_pairing() {
 
   if [[ -n "$pair_addr" && -n "$pair_code" ]]; then
     echo -e "${YELLOW}[*] Pairing with $pair_addr...${NC}"
-    adb pair "$pair_addr" "$pair_code"
+    local pair_out
+    pair_out=$(timeout 30 adb pair "$pair_addr" "$pair_code" 2>&1 || true)
+    echo "    $pair_out"
+    if ! echo "$pair_out" | grep -qi "successfully paired"; then
+      echo -e "${YELLOW}[!] Pairing failed. Check the IP, pairing port and code, then try again.${NC}"
+      exit 1
+    fi
     echo -e "${GREEN}[✓] Pairing successful!${NC}"
     echo ""
     read -rp "  Enter target Connect Port shown on main Wireless Debugging page [default: $PORT]: " target_port </dev/tty || target_port="$PORT"
@@ -138,25 +161,66 @@ handle_android11_pairing() {
   fi
 }
 
+is_cgnat_ip() {
+  # 100.64.0.0/10 (carrier-grade NAT) — never reachable from the LAN
+  [[ "$1" =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\. ]]
+}
+
 step_get_ip() {
   echo -e "${YELLOW}[*] Extracting device IP address...${NC}"
   local ip=""
 
-  # Try ip route first (returns active Wi-Fi / hotspot route IP)
-  ip=$(adb -s "$DEVICE_ID" shell "ip route get 1.1.1.1 2>/dev/null" | grep -oP 'src \K[\d.]+' | head -n1 || true)
+  # NOTE: "ip route get 1.1.1.1" is unreliable — when mobile data is the
+  # phone's default route it returns the cellular IP (behind carrier NAT),
+  # which the PC can never reach. Enumerate interfaces and prefer Wi-Fi.
+  # Output pairs: "<iface> <ipv4>" (e.g. "wlan1 192.168.139.208")
+  local iface_ips
+  iface_ips=$(adb -s "$DEVICE_ID" shell ip addr 2>/dev/null | awk '
+    /^[0-9]+:/ {
+      iface = $2
+      sub(/@.*/, "", iface)  # strip peer suffix (rmnet_data1@rmnet_ipa0)
+      sub(/:$/, "", iface)
+    }
+    /^[[:space:]]+inet / {
+      split($2, a, "/")
+      print iface, a[1]
+    }' || true)
 
-  # Fallback to wlan0 / wlan1 / ap0 / rndis0
-  if [[ -z "$ip" ]]; then
-    ip=$(adb -s "$DEVICE_ID" shell ip addr 2>/dev/null | grep -oP 'inet \K[\d.]+' | grep -v '^127\.' | grep -v '^10\.' | head -n1 || true)
+  local wifi_candidates=() other_candidates=()
+  local iface addr
+  while read -r iface addr; do
+    [[ -z "$addr" ]] && continue
+    case "$addr" in
+      127.*|169.254.*) continue ;;  # loopback / link-local
+    esac
+    if is_cgnat_ip "$addr"; then
+      continue
+    fi
+    case "$iface" in
+      wlan*|ap*|swlan*|wlx*) wifi_candidates+=("$addr") ;;  # Wi-Fi / hotspot
+      rmnet*|ccmni*|pdp*|wwan*) ;;                          # cellular — skip
+      *) other_candidates+=("$addr") ;;
+    esac
+  done <<< "$iface_ips"
+
+  # Pick the first candidate the PC can actually reach
+  local candidate
+  for candidate in "${wifi_candidates[@]}" "${other_candidates[@]}"; do
+    [[ -z "$candidate" ]] && continue
+    if ping -c1 -W1 "$candidate" &>/dev/null; then
+      ip="$candidate"
+      break
+    fi
+  done
+
+  # Nothing pingable (ICMP may be blocked) — fall back to first Wi-Fi IP
+  if [[ -z "$ip" && ${#wifi_candidates[@]} -gt 0 ]]; then
+    ip="${wifi_candidates[0]}"
+    echo -e "${YELLOW}[!] Could not ping $ip, but it is on a Wi-Fi interface; trying it anyway.${NC}"
   fi
 
-  # Fallback to rmnet_data0 (cellular)
   if [[ -z "$ip" ]]; then
-    ip=$(adb -s "$DEVICE_ID" shell ip addr show rmnet_data0 2>/dev/null | grep -oP 'inet \K[\d.]+' | head -n1 || true)
-  fi
-
-  if [[ -z "$ip" ]]; then
-    echo -e "${YELLOW}[!] Could not auto-detect device IP address.${NC}"
+    echo -e "${YELLOW}[!] Could not auto-detect a reachable Wi-Fi IP address.${NC}"
     read -rp "  Enter device IP address manually: " ip </dev/tty || true
     if [[ -z "$ip" ]]; then
       echo -e "${YELLOW}[!] No IP provided. Exiting.${NC}"
@@ -178,12 +242,13 @@ step_tcpip() {
 step_connect() {
   echo -e "${YELLOW}[*] Connecting to $DEVICE_IP:$PORT...${NC}"
   local out
-  out=$(adb connect "$DEVICE_IP:$PORT" 2>&1)
+  # `timeout` guards against adb hanging on unreachable IPs (|| true: keep set -e calm)
+  out=$(timeout 15 adb connect "$DEVICE_IP:$PORT" 2>&1 || true)
   echo "    $out"
-  if echo "$out" | grep -qi "failed\|unable\|error"; then
+  if echo "$out" | grep -qi "failed\|unable\|error" || [[ -z "$out" ]]; then
     echo -e "${YELLOW}[!] Connection failed. Retrying in 3 seconds...${NC}"
     sleep 3
-    out=$(adb connect "$DEVICE_IP:$PORT" 2>&1)
+    out=$(timeout 15 adb connect "$DEVICE_IP:$PORT" 2>&1 || true)
     echo "    $out"
   fi
 }
@@ -229,7 +294,6 @@ step_show_shortcuts() {
 step_launch_scrcpy() {
   echo -e "${YELLOW}[*] Launching scrcpy in the background...${NC}"
   if [[ -n "$SCRCPY_ARGS" ]]; then
-    # Parse scrcpy args safely
     nohup scrcpy -s "$DEVICE_IP:$PORT" $SCRCPY_ARGS >/dev/null 2>&1 &
   else
     nohup scrcpy -s "$DEVICE_IP:$PORT" >/dev/null 2>&1 &
@@ -264,10 +328,7 @@ main() {
     fi
   fi
 
-  if check_scrcpy; then
-    step_show_shortcuts
-    step_launch_scrcpy
-  fi
+  handle_scrcpy_option
 
   echo ""
   echo -e "${GREEN}  Done! Enjoy wireless ADB.${NC}"
