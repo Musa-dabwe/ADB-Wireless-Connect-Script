@@ -6,7 +6,7 @@ Automate connecting your Android phone to ADB over a wireless connection and lau
 
 - **Automated USB Setup**: Automatically detects USB-tethered phone, switches device to TCP/IP mode (`adb tcpip 5555` or custom port), extracts IP address, and connects wirelessly.
 - **Android 11+ Wire-Free Pairing**: Pair over Wi-Fi using Android 11+ `adb pair` when no USB cable is available.
-- **Smart Dynamic IP Detection**: Auto-detects IP address across multiple interfaces (`wlan0`, `wlan1`, `ip route`, `rmnet_data0`, `rndis0`, `ap0`).
+- **Smart Dynamic IP Detection**: Prefers Wi-Fi/hotspot interfaces (`wlan0`, `wlan1`, `ap0`, …), skips cellular/carrier-NAT IPs that are unreachable from your PC, and pings candidates to confirm reachability before connecting.
 - **Multi-Device Selector**: Displays an interactive menu if multiple USB devices are attached.
 - **Screen Mirroring Integration**: Optionally launches `scrcpy` in the background with keyboard shortcut guidance.
 - **Dedicated Cleanup (`stop.sh`)**: Interactive or non-interactive wireless session disconnect and ADB server restart tool.
