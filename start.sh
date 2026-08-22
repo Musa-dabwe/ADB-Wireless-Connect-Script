@@ -7,8 +7,6 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 PORT=5555
-SCRCPY_MODE="prompt" # Options: prompt, yes, no
-SCRCPY_ARGS=""
 
 show_help() {
   echo -e "${CYAN}ADB Wireless Connect - start.sh${NC}"
@@ -16,9 +14,6 @@ show_help() {
   echo "Usage: ./start.sh [options]"
   echo ""
   echo "Options:"
-  echo "  -s, --scrcpy          Automatically launch scrcpy without prompting"
-  echo "  -n, --no-scrcpy       Skip launching scrcpy screen mirroring"
-  echo "  -a, --scrcpy-args S   Pass custom arguments to scrcpy (e.g. --scrcpy-args \"--turn-screen-off --stay-awake\")"
   echo "  -p, --port P          Specify target TCP port (default: 5555)"
   echo "  -h, --help            Show this help message"
   echo ""
@@ -27,18 +22,6 @@ show_help() {
 # Parse CLI flags
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
-    -s|--scrcpy) SCRCPY_MODE="yes"; shift ;;
-    -n|--no-scrcpy) SCRCPY_MODE="no"; shift ;;
-    -a|--scrcpy-args)
-      if [[ -z "$2" || "$2" =~ ^- ]]; then
-        echo -e "${YELLOW}[!] Option $1 requires an argument.${NC}"
-        show_help
-        exit 1
-      fi
-      SCRCPY_ARGS="$2"
-      SCRCPY_MODE="yes"
-      shift 2
-      ;;
     -p|--port)
       if [[ -z "$2" || "$2" =~ ^- ]]; then
         echo -e "${YELLOW}[!] Option $1 requires a port argument.${NC}"
@@ -74,39 +57,6 @@ check_adb() {
     exit 1
   fi
   echo -e "${GREEN}[✓] adb detected${NC}"
-}
-
-handle_scrcpy_option() {
-  if [[ "$SCRCPY_MODE" == "no" ]]; then
-    return 0
-  fi
-
-  if [[ "$SCRCPY_MODE" == "prompt" ]]; then
-    echo ""
-    read -rp "  Would you like to launch scrcpy for screen mirroring? [y/N]: " choice </dev/tty || choice="n"
-    if [[ ! "$choice" =~ ^[Yy]$ ]]; then
-      echo -e "${YELLOW}[*] Skipping scrcpy launch.${NC}"
-      return 0
-    fi
-  fi
-
-  if ! command -v scrcpy &>/dev/null; then
-    echo ""
-    echo -e "${YELLOW}[!] scrcpy not found. Install it:${NC}"
-    echo "    sudo apt install scrcpy              # Debian/Ubuntu/Pop!_OS"
-    echo "    sudo dnf install scrcpy              # Fedora"
-    echo "    sudo pacman -S scrcpy                # Arch"
-    echo ""
-    read -rp "  Press Enter after installing scrcpy, or Ctrl+C to skip..." </dev/tty || true
-    if ! command -v scrcpy &>/dev/null; then
-      echo -e "${YELLOW}[!] scrcpy still not found. Skipping scrcpy launch.${NC}"
-      return 0
-    fi
-  fi
-
-  echo -e "${GREEN}[✓] scrcpy detected${NC}"
-  step_show_shortcuts
-  step_launch_scrcpy
 }
 
 detect_usb_device() {
@@ -276,31 +226,6 @@ step_disconnect_usb_prompt() {
   fi
 }
 
-step_show_shortcuts() {
-  echo ""
-  echo -e "${CYAN}  === scrcpy Keyboard Shortcuts ===${NC}"
-  echo ""
-  echo "    Alt + H    →  Home"
-  echo "    Alt + B    →  Back"
-  echo "    Alt + S    →  Switch apps"
-  echo "    Alt + F    →  Fullscreen"
-  echo "    Alt + Up   →  Volume up"
-  echo "    Alt + Down →  Volume down"
-  echo "    Alt + O    →  Turn phone screen off"
-  echo "    Alt + P    →  Power button"
-  echo ""
-}
-
-step_launch_scrcpy() {
-  echo -e "${YELLOW}[*] Launching scrcpy in the background...${NC}"
-  if [[ -n "$SCRCPY_ARGS" ]]; then
-    nohup scrcpy -s "$DEVICE_IP:$PORT" $SCRCPY_ARGS >/dev/null 2>&1 &
-  else
-    nohup scrcpy -s "$DEVICE_IP:$PORT" >/dev/null 2>&1 &
-  fi
-  echo -e "${GREEN}[✓] scrcpy started (PID: $!)${NC}"
-}
-
 main() {
   print_banner
   check_adb
@@ -328,10 +253,9 @@ main() {
     fi
   fi
 
-  handle_scrcpy_option
-
   echo ""
   echo -e "${GREEN}  Done! Enjoy wireless ADB.${NC}"
+  echo -e "${CYAN}  Run ./scrcpy.sh to launch screen mirroring.${NC}"
 }
 
 main

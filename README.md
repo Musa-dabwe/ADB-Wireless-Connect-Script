@@ -1,16 +1,16 @@
 # ADB Wireless Connect Script
 
-Automate connecting your Android phone to ADB over a wireless connection and launch `scrcpy` for screen mirroring — with modular `start.sh` and `stop.sh` scripts.
+Automate connecting your Android phone to ADB over a wireless connection, with a separate script for `scrcpy` screen mirroring.
 
 ## 🌟 Features
 
 - **Automated USB Setup**: Automatically detects USB-tethered phone, switches device to TCP/IP mode (`adb tcpip 5555` or custom port), extracts IP address, and connects wirelessly.
 - **Android 11+ Wire-Free Pairing**: Pair over Wi-Fi using Android 11+ `adb pair` when no USB cable is available.
-- **Smart Dynamic IP Detection**: Prefers Wi-Fi/hotspot interfaces (`wlan0`, `wlan1`, `ap0`, …), skips cellular/carrier-NAT IPs that are unreachable from your PC, and pings candidates to confirm reachability before connecting.
+- **Smart Dynamic IP Detection**: Prefers Wi-Fi/hotspot interfaces (`wlan0`, `wlan1`, `ap0`, …), skips cellular/carrier-NAT IPs that are unreachable from your PC, and pings candidates to confirm reachability. If ICMP is blocked or ping fails, falls back to the first suitable Wi-Fi address.
 - **Multi-Device Selector**: Displays an interactive menu if multiple USB devices are attached.
-- **Screen Mirroring Integration**: Optionally launches `scrcpy` in the background with keyboard shortcut guidance.
+- **scrcpy Launcher (`scrcpy.sh`)**: Standalone script with interactive resolution and FPS selection menus.
 - **Dedicated Cleanup (`stop.sh`)**: Interactive or non-interactive wireless session disconnect and ADB server restart tool.
-- **CLI Options**: Supports non-interactive flags like `--no-scrcpy`, `--scrcpy-args`, `--port`, and `--all`.
+- **CLI Options**: Supports non-interactive flags like `--port`, `--all`, and `--kill`.
 
 ---
 
@@ -32,7 +32,7 @@ Automate connecting your Android phone to ADB over a wireless connection and lau
 ```bash
 git clone git@github.com:Musa-dabwe/ADB-Wireless-Connect-Script.git
 cd ADB-Wireless-Connect-Script
-chmod +x start.sh stop.sh
+chmod +x start.sh stop.sh scrcpy.sh
 ```
 
 ### Install Dependencies
@@ -76,10 +76,34 @@ sudo pacman -S scrcpy
 ./start.sh [options]
 
 Options:
-  -n, --no-scrcpy       Skip launching scrcpy screen mirroring
-  -a, --scrcpy-args S   Pass custom arguments to scrcpy (e.g. -a "--turn-screen-off --stay-awake")
   -p, --port P          Specify target TCP port (default: 5555)
   -h, --help            Show help message
+```
+
+---
+
+### Launching Screen Mirroring (scrcpy)
+
+After connecting wirelessly, run:
+
+```bash
+./scrcpy.sh
+```
+
+The script will:
+1. Detect connected wireless ADB devices
+2. Prompt you to select resolution (1280/800/640/Original)
+3. Prompt you to select frame rate (60/30/Default)
+4. Show keyboard shortcuts and launch scrcpy
+
+#### CLI Options for `scrcpy.sh`:
+```bash
+./scrcpy.sh [options]
+
+Options:
+  -a, --args ...     Pass custom arguments to scrcpy (must be final option, skips prompts)
+  -s, --serial S      Specify device serial (e.g. 192.168.1.50:5555)
+  -h, --help          Show help message
 ```
 
 ---
