@@ -33,6 +33,13 @@ while [[ "$#" -gt 0 ]]; do
         show_help
         exit 1
       fi
+      for _a in "$@"; do
+        if [[ "$_a" == "-s" || "$_a" == "--serial" ]]; then
+          echo -e "${YELLOW}[!] -s/--serial must come before -a/--args.${NC}"
+          show_help
+          exit 1
+        fi
+      done
       SCRCPY_ARGS=("$@")
       shift "$#"
       ;;
@@ -75,13 +82,17 @@ check_scrcpy() {
   echo -e "${GREEN}[✓] scrcpy detected${NC}"
 }
 
+_connected_devices() {
+  adb devices | awk 'NR>1 && $2=="device" {print $1}'
+}
+
 detect_device() {
   if [[ -n "$DEVICE_SERIAL" ]]; then
-    if ! adb devices | awk 'NR>1 && $2=="device" {print $1}' | grep -q "^${DEVICE_SERIAL}$"; then
+    if ! _connected_devices | grep -q "^${DEVICE_SERIAL}$"; then
       echo -e "${YELLOW}[!] Specified device $DEVICE_SERIAL is not connected or not authorized.${NC}"
       echo ""
       echo "  Connected devices:"
-      adb devices | awk 'NR>1 && $2=="device" {print "    " $1}'
+      _connected_devices | sed 's/^/    /'
       exit 1
     fi
     echo -e "${GREEN}[✓] Using specified device: $DEVICE_SERIAL${NC}"
@@ -89,7 +100,7 @@ detect_device() {
   fi
 
   local devices
-  mapfile -t devices < <(adb devices | awk 'NR>1 && $2=="device" && $1 ~ /:[0-9]+$/ {print $1}')
+  mapfile -t devices < <(_connected_devices | awk '$1 ~ /:[0-9]+$/ {print $1}')
 
   if [[ ${#devices[@]} -eq 0 ]]; then
     echo -e "${YELLOW}[!] No wireless ADB devices found.${NC}"
@@ -165,10 +176,8 @@ launch_scrcpy() {
   echo -e "${YELLOW}[*] Launching scrcpy...${NC}"
   if [[ ${#SCRCPY_ARGS[@]} -gt 0 ]]; then
     echo -e "${CYAN}    Args: ${SCRCPY_ARGS[*]}${NC}"
-    nohup scrcpy -s "$DEVICE_SERIAL" "${SCRCPY_ARGS[@]}" >/dev/null 2>&1 &
-  else
-    nohup scrcpy -s "$DEVICE_SERIAL" >/dev/null 2>&1 &
   fi
+  nohup scrcpy -s "$DEVICE_SERIAL" "${SCRCPY_ARGS[@]}" >/dev/null 2>&1 &
   echo -e "${GREEN}[✓] scrcpy started (PID: $!)${NC}"
 }
 

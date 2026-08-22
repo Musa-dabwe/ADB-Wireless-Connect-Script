@@ -116,6 +116,13 @@ is_cgnat_ip() {
   [[ "$1" =~ ^100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\. ]]
 }
 
+is_unreachable_ip() {
+  # Private RFC1918 ranges that, on a non-Wi-Fi interface, are treated as
+  # unreachable (e.g. carrier NAT 10.x.x.x). Wi-Fi LANs legitimately use these
+  # ranges, so this is only applied to unknown / non-Wi-Fi interfaces.
+  [[ "$1" =~ ^10\. ]] || [[ "$1" =~ ^172\.(1[6-9]|2[0-9]|3[01])\. ]]
+}
+
 step_get_ip() {
   echo -e "${YELLOW}[*] Extracting device IP address...${NC}"
   local ip=""
@@ -149,7 +156,13 @@ step_get_ip() {
     case "$iface" in
       wlan*|ap*|swlan*|wlx*) wifi_candidates+=("$addr") ;;  # Wi-Fi / hotspot
       rmnet*|ccmni*|pdp*|wwan*) ;;                          # cellular — skip
-      *) other_candidates+=("$addr") ;;
+      *)
+        # Unknown interface: a private RFC1918 range here is treated as
+        # unreachable (e.g. carrier NAT 10.x.x.x), not a real Wi-Fi LAN.
+        if is_unreachable_ip "$addr"; then
+          continue
+        fi
+        other_candidates+=("$addr") ;;
     esac
   done <<< "$iface_ips"
 
@@ -189,17 +202,23 @@ step_tcpip() {
   sleep 2
 }
 
-step_connect() {
-  echo -e "${YELLOW}[*] Connecting to $DEVICE_IP:$PORT...${NC}"
+_try_connect() {
   local out
   # `timeout` guards against adb hanging on unreachable IPs (|| true: keep set -e calm)
   out=$(timeout 15 adb connect "$DEVICE_IP:$PORT" 2>&1 || true)
   echo "    $out"
   if echo "$out" | grep -qi "failed\|unable\|error" || [[ -z "$out" ]]; then
+    return 1
+  fi
+  return 0
+}
+
+step_connect() {
+  echo -e "${YELLOW}[*] Connecting to $DEVICE_IP:$PORT...${NC}"
+  if ! _try_connect; then
     echo -e "${YELLOW}[!] Connection failed. Retrying in 3 seconds...${NC}"
     sleep 3
-    out=$(timeout 15 adb connect "$DEVICE_IP:$PORT" 2>&1 || true)
-    echo "    $out"
+    _try_connect
   fi
 }
 
