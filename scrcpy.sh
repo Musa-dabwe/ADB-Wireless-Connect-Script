@@ -34,9 +34,10 @@ while [[ "$#" -gt 0 ]]; do
         show_help
         exit 1
       fi
-      # --args swallows the rest of the command line, so a second -a/--serial
-      # can only ever arrive inside the first batch: reject it there instead of
-      # silently discarding the arguments already collected.
+      # --args takes the rest of the command line verbatim, so a second -a can
+      # only turn up inside that first batch, where it would be forwarded to
+      # scrcpy as an unknown option; -s/--serial inside a batch can no longer be
+      # read as a script option at all. Both are rejected here.
       for _a in "$@"; do
         case "$_a" in
           -s|--serial)
@@ -45,7 +46,7 @@ while [[ "$#" -gt 0 ]]; do
             exit 1
             ;;
           -a|--args)
-            echo -e "${YELLOW}[!] Option -a/--args may only be given once; a second occurrence would discard the first batch of arguments.${NC}"
+            echo -e "${YELLOW}[!] Option -a/--args may only be given once; everything after it is already forwarded to scrcpy as arguments.${NC}"
             show_help
             exit 1
             ;;
@@ -94,8 +95,11 @@ check_scrcpy() {
   # unusable, so warn and let launch_scrcpy report any real failure.
   local probe version
   probe=$(scrcpy --version 2>/dev/null) || probe=""
+  # Real scrcpy reports "scrcpy 4.1 <https://github.com/Genymobile/scrcpy>";
+  # only the version field belongs on the success line.
   version="${probe%%$'\n'*}"
   version="${version#scrcpy }"
+  version="${version%%[[:space:]]*}"
 
   if [[ -n "$version" ]]; then
     echo -e "${GREEN}[✓] scrcpy detected (version ${version})${NC}"

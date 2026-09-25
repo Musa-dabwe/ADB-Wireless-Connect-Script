@@ -26,7 +26,13 @@ EOF
 cat >"$TEST_DIR/bin/scrcpy" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "--version" ]]; then
-  echo "scrcpy 4.1"
+  # Real scrcpy appends the upstream URL; the launcher must render only the
+  # version field. MOCK_SCRCPY_VERSION=fail drives the probe-failure path.
+  if [[ "${MOCK_SCRCPY_VERSION:-ok}" != "ok" ]]; then
+    echo "mock scrcpy --version failure" >&2
+    exit 3
+  fi
+  echo "scrcpy 4.1 <https://github.com/Genymobile/scrcpy>"
   exit 0
 fi
 
@@ -90,6 +96,33 @@ fail() {
   echo "FAIL: $1" >&2
   [[ $# -ge 2 ]] && echo "$2" >&2
   exit 1
+}
+
+# Generic runner for the argument-handling cases: run_case <mode> <tag> <devices>
+# [script args...]. Set MOCK_SCRCPY_VERSION in the caller's environment (use a
+# command substitution so it does not leak between cases).
+run_case() {
+  local mode=$1
+  local tag=$2
+  local devices=$3
+  shift 3
+  MOCK_SCRCPY_MODE="$mode" \
+  MOCK_SCRCPY_VERSION="${MOCK_SCRCPY_VERSION:-ok}" \
+  MOCK_SCRCPY_PID_FILE="$TEST_DIR/scrcpy-$tag.pid" \
+  MOCK_ADB_DEVICES="$devices" \
+  HOME="$TEST_DIR/home" \
+  XDG_STATE_HOME="$TEST_DIR/state" \
+  PATH="$TEST_DIR/bin:$PATH" \
+    timeout 3s bash "$ROOT_DIR/scrcpy.sh" "$@" </dev/null 2>&1
+}
+
+# Stop a backgrounded mock scrcpy left behind by a case that had to launch one.
+stop_mock_scrcpy() {
+  local tag=$1
+  if [[ -s "$TEST_DIR/scrcpy-$tag.pid" ]]; then
+    kill "$(cat "$TEST_DIR/scrcpy-$tag.pid")" 2>/dev/null || true
+    rm -f "$TEST_DIR/scrcpy-$tag.pid"
+  fi
 }
 
 extract_log_path() {
@@ -190,4 +223,77 @@ status=$?
 [[ "$out" == *"adb not found"* ]] || fail "missing adb was not detected" "$out"
 [[ "$out" != *"No connected ADB devices found"* ]] || fail "missing adb was misreported as no devices" "$out"
 
+# --- Task 2: input handling, matching, and the version probe ----------------
+
+WIRELESS_DEVICES="List of devices attached
+192.168.70.125:5555    device"
+
+# The serial is matched literally: '.' must not behave as a regex wildcard, so a
+# lookalike serial does not satisfy --serial 1.2.3.4:5555.
+output=$(run_case running nearmiss "List of devices attached
+1x2y3z4:5555    device" --serial 1.2.3.4:5555 --args --no-audio)
+status=$?
+[[ $status -eq 1 ]] || fail "dotted serial matched a lookalike device (status $status)" "$output"
+[[ "$output" == *"Specified device 1.2.3.4:5555 is not connected"* ]] || fail "lookalike serial was not rejected" "$output"
+[[ "$output" != *"scrcpy started"* ]] || fail "launcher started scrcpy against a non-matching serial" "$output"
+
+# A serial that really is present is still matched.
+output=$(run_case running exactserial "$WIRELESS_DEVICES" --serial 192.168.70.125:5555 --args --no-audio)
+status=$?
+[[ $status -eq 0 ]] || fail "exact dotted serial was not accepted (status $status)" "$output"
+[[ "$output" == *"Using specified device: 192.168.70.125:5555"* ]] || fail "exact serial was not used" "$output"
+stop_mock_scrcpy exactserial
+
+# -a may only be given once: a repeat inside the first batch is rejected.
+output=$(run_case running dupargs "$WIRELESS_DEVICES" -a --no-audio -a --max-size=800)
+status=$?
+[[ $status -eq 1 ]] || fail "repeated -a was accepted (status $status)" "$output"
+[[ "$output" == *"may only be given once"* ]] || fail "repeated -a message is missing" "$output"
+[[ "$output" != *"scrcpy started"* ]] || fail "launcher proceeded despite a repeated -a" "$output"
+
+# Even a bare repeat with nothing around it is rejected.
+output=$(run_case running dupbare "$WIRELESS_DEVICES" -a -a)
+status=$?
+[[ $status -eq 1 ]] || fail "bare repeated -a was accepted (status $status)" "$output"
+[[ "$output" == *"may only be given once"* ]] || fail "bare repeated -a message is missing" "$output"
+
+# -s/--serial inside the batch is still rejected, with its own message.
+output=$(run_case running innerargs "$WIRELESS_DEVICES" -a --no-audio -s 192.168.70.125:5555)
+status=$?
+[[ $status -eq 1 ]] || fail "-s inside --args was accepted (status $status)" "$output"
+[[ "$output" == *"must come before -a/--args"* ]] || fail "-s inside --args message is missing" "$output"
+
+# A single -a batch with several arguments is still accepted and forwarded.
+output=$(run_case running singleargs "$WIRELESS_DEVICES" -a --no-audio --max-size=800)
+status=$?
+[[ $status -eq 0 ]] || fail "single -a batch was rejected (status $status)" "$output"
+[[ "$output" == *"Args: --no-audio --max-size=800"* ]] || fail "arguments were not forwarded to scrcpy" "$output"
+[[ "$output" == *"scrcpy started"* ]] || fail "launcher did not start with a single -a batch" "$output"
+stop_mock_scrcpy singleargs
+
+# A trailing --serial with no value must be reported, not crash on set -u.
+output=$(run_case running noserial "$WIRELESS_DEVICES" --serial)
+status=$?
+[[ $status -eq 1 ]] || fail "bare trailing --serial returned $status; expected 1" "$output"
+[[ "$output" == *"requires a device serial"* ]] || fail "trailing --serial message is missing" "$output"
+[[ "$output" != *"unbound variable"* ]] || fail "trailing --serial died on an unbound variable under set -u" "$output"
+
+# The detected version is reported, trimmed of the upstream URL.
+output=$(run_case running versionok "$WIRELESS_DEVICES" --serial 192.168.70.125:5555 --args --no-audio)
+status=$?
+[[ $status -eq 0 ]] || fail "launcher failed while reporting the version (status $status)" "$output"
+[[ "$output" == *"scrcpy detected (version 4.1)"* ]] || fail "scrcpy version was not reported" "$output"
+[[ "$output" != *"github.com"* ]] || fail "the version line leaked the scrcpy --version URL" "$output"
+stop_mock_scrcpy versionok
+
+# A failing version probe warns and continues; it must not abort the launch.
+output=$(MOCK_SCRCPY_VERSION=fail run_case running versionfail "$WIRELESS_DEVICES" \
+  --serial 192.168.70.125:5555 --args --no-audio)
+status=$?
+[[ $status -eq 0 ]] || fail "failing version probe aborted the launch (status $status)" "$output"
+[[ "$output" == *"Could not determine the scrcpy version"* ]] || fail "failing version probe did not warn" "$output"
+[[ "$output" == *"scrcpy started"* ]] || fail "launcher did not proceed after a version probe failure" "$output"
+stop_mock_scrcpy versionfail
+
 echo "PASS: launcher reports startup failures, isolates background launch logs, and detects USB devices"
+echo "PASS: launcher matches serials literally, rejects repeated -a/--args, and reports the scrcpy version"
