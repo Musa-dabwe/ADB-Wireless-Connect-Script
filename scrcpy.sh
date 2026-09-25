@@ -14,10 +14,11 @@ show_help() {
   echo "Usage: ./scrcpy.sh [options]"
   echo ""
   echo "Launch scrcpy for screen mirroring with custom resolution and FPS options."
+  echo "Works with any connected device: USB (e.g. 422ae881) or wireless (e.g. 192.168.1.50:5555)."
   echo ""
   echo "Options:"
   echo "  -a, --args ...      Pass custom arguments to scrcpy (must be final option)"
-  echo "  -s, --serial S      Specify device serial (e.g. 192.168.1.50:5555)"
+  echo "  -s, --serial S      Specify device serial (USB id or ip:port)"
   echo "  -h, --help          Show this help message"
   echo ""
 }
@@ -82,8 +83,49 @@ check_scrcpy() {
   echo -e "${GREEN}[✓] scrcpy detected${NC}"
 }
 
+check_adb() {
+  if ! command -v adb &>/dev/null; then
+    echo -e "${YELLOW}[!] adb not found on this system.${NC}"
+    echo ""
+    echo "  Install Android platform tools:"
+    echo "    pkexec apt install adb               # Debian/Ubuntu/Pop!_OS"
+    echo "    pkexec dnf install android-tools       # Fedora"
+    echo "    pkexec pacman -S android-tools        # Arch"
+    echo ""
+    echo -e "${YELLOW}  After installing, re-run this script.${NC}"
+    exit 1
+  fi
+  echo -e "${GREEN}[✓] adb detected${NC}"
+}
+
 _connected_devices() {
-  adb devices | awk 'NR>1 && $2=="device" {print $1}'
+  adb devices 2>/dev/null | awk 'NR>1 && $2=="device" {print $1}'
+}
+
+# Devices adb knows about but that are not usable yet: unauthorized, offline, etc.
+_pending_devices() {
+  adb devices 2>/dev/null | awk 'NR>1 && $2!="device" && NF>=2 {print $1" ("$2")"}'
+}
+
+# Wireless serials are host:port, emulators use the emulator-NNNN convention,
+# everything else is a USB device id.
+_device_kind() {
+  if [[ "$1" =~ :[0-9]+$ ]]; then
+    echo "wireless"
+  elif [[ "$1" == emulator-* ]]; then
+    echo "emulator"
+  else
+    echo "usb"
+  fi
+}
+
+# Wireless devices first so the default pick stays wireless when both are present.
+_sorted_devices() {
+  local d
+  while read -r d; do
+    [[ -n "$d" ]] || continue
+    echo "$(_device_kind "$d") $d"
+  done < <(_connected_devices) | sort -k1,1r -k2,2
 }
 
 detect_device() {
@@ -91,37 +133,61 @@ detect_device() {
     if ! _connected_devices | grep -q "^${DEVICE_SERIAL}$"; then
       echo -e "${YELLOW}[!] Specified device $DEVICE_SERIAL is not connected or not authorized.${NC}"
       echo ""
-      echo "  Connected devices:"
-      _connected_devices | sed 's/^/    /'
+      echo "  Usable devices:"
+      _sorted_devices | sed 's/^\([^ ]*\) \(.*\)$/    \2  [\1]/'
+      _pending_devices | sed 's/^/    (pending) /'
       exit 1
     fi
-    echo -e "${GREEN}[✓] Using specified device: $DEVICE_SERIAL${NC}"
+    echo -e "${GREEN}[✓] Using specified device: $DEVICE_SERIAL ($(_device_kind "$DEVICE_SERIAL"))${NC}"
     return 0
   fi
 
-  local devices
-  mapfile -t devices < <(_connected_devices | awk '$1 ~ /:[0-9]+$/ {print $1}')
+  local rows
+  mapfile -t rows < <(_sorted_devices)
 
-  if [[ ${#devices[@]} -eq 0 ]]; then
-    echo -e "${YELLOW}[!] No wireless ADB devices found.${NC}"
+  if [[ ${#rows[@]} -eq 0 ]]; then
+    local pending
+    mapfile -t pending < <(_pending_devices)
+
+    if [[ ${#pending[@]} -gt 0 ]]; then
+      echo -e "${YELLOW}[!] No usable ADB devices found, but adb sees:${NC}"
+      for p in "${pending[@]}"; do
+        echo "    $p"
+      done
+      echo ""
+      if printf '%s\n' "${pending[@]}" | grep -q "unauthorized"; then
+        echo "  Unlock the phone and accept the 'Allow USB debugging?' prompt."
+        echo "  Tick 'Always allow from this computer' to avoid this again."
+      elif printf '%s\n' "${pending[@]}" | grep -q "offline"; then
+        echo "  Device is offline: replug the cable, or re-run 'adb kill-server && adb start-server'."
+      else
+        echo "  Device is not ready: replug the cable and re-run this script."
+      fi
+      echo ""
+      exit 1
+    fi
+
+    echo -e "${YELLOW}[!] No connected ADB devices found (USB or wireless).${NC}"
     echo ""
     echo "  Connect a device first:"
     echo "    ./start.sh              # USB setup"
-    echo "    adb pair <ip:port>      # Android 11+ pairing"
+    echo "    adb pair <ip:port>      # Android 11+ wireless pairing"
     echo ""
     exit 1
-  elif [[ ${#devices[@]} -eq 1 ]]; then
-    DEVICE_SERIAL="${devices[0]}"
-    echo -e "${GREEN}[✓] Device detected: $DEVICE_SERIAL${NC}"
+  elif [[ ${#rows[@]} -eq 1 ]]; then
+    DEVICE_SERIAL="${rows[0]#* }"
+    echo -e "${GREEN}[✓] Device detected: $DEVICE_SERIAL (${rows[0]%% *})${NC}"
   else
-    echo -e "${YELLOW}[*] Multiple wireless devices detected:${NC}"
-    for i in "${!devices[@]}"; do
-      echo "    $((i+1))) ${devices[$i]}"
+    echo -e "${YELLOW}[*] Multiple devices detected:${NC}"
+    for i in "${!rows[@]}"; do
+      echo "    $((i+1))) ${rows[$i]#* }  [${rows[$i]%% *}]"
     done
-    read -rp "  Select device number [1-${#devices[@]}]: " choice </dev/tty || choice=1
+    read -rp "  Select device number [1-${#rows[@]}, default: 1]: " choice </dev/tty || choice=1
+    [[ "$choice" =~ ^[0-9]+$ ]] || choice=1
     local idx=$((choice-1))
-    DEVICE_SERIAL="${devices[$idx]:-${devices[0]}}"
-    echo -e "${GREEN}[✓] Selected device: $DEVICE_SERIAL${NC}"
+    [[ $idx -ge 0 && $idx -lt ${#rows[@]} ]] || idx=0
+    DEVICE_SERIAL="${rows[$idx]#* }"
+    echo -e "${GREEN}[✓] Selected device: $DEVICE_SERIAL (${rows[$idx]%% *})${NC}"
   fi
 }
 
@@ -208,6 +274,7 @@ launch_scrcpy() {
 
 main() {
   print_banner
+  check_adb
   check_scrcpy
   detect_device
 

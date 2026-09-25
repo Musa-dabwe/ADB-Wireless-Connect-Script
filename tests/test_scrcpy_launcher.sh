@@ -10,6 +10,10 @@ mkdir -p "$TEST_DIR/bin" "$TEST_DIR/home" "$TEST_DIR/state"
 cat >"$TEST_DIR/bin/adb" <<'EOF'
 #!/usr/bin/env bash
 if [[ "${1:-}" == "devices" ]]; then
+  if [[ -n "${MOCK_ADB_DEVICES:-}" ]]; then
+    printf '%s\n' "$MOCK_ADB_DEVICES"
+    exit 0
+  fi
   cat <<'OUTPUT'
 List of devices attached
 192.168.70.125:5555    device
@@ -56,11 +60,30 @@ run_launcher() {
   local tag=${2:-default}
   MOCK_SCRCPY_MODE="$mode" \
   MOCK_SCRCPY_PID_FILE="$TEST_DIR/scrcpy-$tag.pid" \
+  MOCK_ADB_DEVICES="${MOCK_ADB_DEVICES:-}" \
   HOME="$TEST_DIR/home" \
   XDG_STATE_HOME="$TEST_DIR/state" \
   PATH="$TEST_DIR/bin:$PATH" \
     timeout 3s bash "$ROOT_DIR/scrcpy.sh" \
       --serial 192.168.70.125:5555 --args --no-audio 2>&1
+}
+
+# Device detection: no --serial, stdin closed so the prompt falls back to default.
+run_detect() {
+  local devices=$1
+  local tag=${2:-detect}
+  MOCK_SCRCPY_MODE=running \
+  MOCK_SCRCPY_PID_FILE="$TEST_DIR/scrcpy-$tag.pid" \
+  MOCK_ADB_DEVICES="$devices" \
+  HOME="$TEST_DIR/home" \
+  XDG_STATE_HOME="$TEST_DIR/state" \
+  PATH="$TEST_DIR/bin:$PATH" \
+    timeout 3s bash "$ROOT_DIR/scrcpy.sh" --args --no-audio </dev/null 2>&1
+  local status=$?
+  if [[ -s "$TEST_DIR/scrcpy-$tag.pid" ]]; then
+    kill "$(cat "$TEST_DIR/scrcpy-$tag.pid")" 2>/dev/null || true
+  fi
+  return $status
 }
 
 fail() {
@@ -105,4 +128,66 @@ second_log=$(extract_log_path <<<"$second_output")
 [[ "$first_log" != "$second_log" ]] || fail "concurrent launches shared the same scrcpy log" "$first_output$second_output"
 kill "$first_pid" "$second_pid" 2>/dev/null || true
 
-echo "PASS: launcher reports startup failures and isolates background launch logs"
+# USB-only device must be detected, not rejected as "no wireless devices".
+output=$(run_detect "List of devices attached
+422ae881               device usb:2-3")
+status=$?
+[[ $status -eq 0 ]] || fail "USB-only device was not accepted (status $status)" "$output"
+[[ "$output" == *"Device detected: 422ae881 (usb)"* ]] || fail "USB device serial was not detected" "$output"
+[[ "$output" != *"No wireless ADB devices"* ]] || fail "launcher still reports wireless-only error" "$output"
+
+# Mixed set: all transports listed, wireless sorted first and picked by default.
+output=$(run_detect "List of devices attached
+422ae881               device usb:2-3
+192.168.70.125:5555    device
+emulator-5554          device" mixed)
+[[ "$output" == *"1) 192.168.70.125:5555  [wireless]"* ]] || fail "wireless device was not listed first" "$output"
+[[ "$output" == *"2) 422ae881  [usb]"* ]] || fail "USB device was not listed" "$output"
+[[ "$output" == *"3) emulator-5554  [emulator]"* ]] || fail "emulator device was not listed" "$output"
+[[ "$output" == *"Selected device: 192.168.70.125:5555 (wireless)"* ]] || fail "default pick was not the wireless device" "$output"
+
+# No devices at all: exits 1 with connection hints.
+output=$(run_detect "List of devices attached
+")
+status=$?
+[[ $status -eq 1 ]] || fail "empty device list returned $status; expected 1" "$output"
+[[ "$output" == *"No connected ADB devices found (USB or wireless)"* ]] || fail "empty device list message is wrong" "$output"
+
+# Unauthorized device must be named, with the RSA-prompt hint, not reported as "no devices".
+output=$(run_detect "List of devices attached
+422ae881               unauthorized usb:2-3")
+status=$?
+[[ $status -eq 1 ]] || fail "unauthorized device returned $status; expected 1" "$output"
+[[ "$output" == *"422ae881 (unauthorized)"* ]] || fail "unauthorized device was not reported" "$output"
+[[ "$output" == *"Allow USB debugging"* ]] || fail "unauthorized hint is missing" "$output"
+[[ "$output" != *"No connected ADB devices found"* ]] || fail "unauthorized device was reported as absent" "$output"
+
+# Offline device gets its own remediation.
+output=$(run_detect "List of devices attached
+192.168.70.125:5555    offline")
+[[ "$output" == *"192.168.70.125:5555 (offline)"* ]] || fail "offline device was not reported" "$output"
+[[ "$output" == *"replug the cable"* ]] || fail "offline hint is missing" "$output"
+
+# A usable device still wins over a pending one.
+output=$(run_detect "List of devices attached
+422ae881               device usb:2-3
+emulator-5554          offline")
+[[ "$output" == *"Device detected: 422ae881 (usb)"* ]] || fail "usable device was not preferred over pending one" "$output"
+
+# Missing adb binary is reported as such, not as "no devices".
+# Mirror /usr/bin without adb (or scrcpy) so the rest of the script still works.
+mkdir -p "$TEST_DIR/no-adb-bin"
+for tool_path in /usr/bin/*; do
+  tool=$(basename "$tool_path")
+  [[ "$tool" == "adb" || "$tool" == "scrcpy" ]] && continue
+  [[ -x "$tool_path" ]] || continue
+  ln -sf "$tool_path" "$TEST_DIR/no-adb-bin/$tool" 2>/dev/null || true
+done
+out=$(env -i HOME="$TEST_DIR/home" XDG_STATE_HOME="$TEST_DIR/state" \
+  PATH="$TEST_DIR/no-adb-bin" timeout 3s bash "$ROOT_DIR/scrcpy.sh" </dev/null 2>&1)
+status=$?
+[[ $status -eq 1 ]] || fail "missing adb returned $status; expected 1" "$out"
+[[ "$out" == *"adb not found"* ]] || fail "missing adb was not detected" "$out"
+[[ "$out" != *"No connected ADB devices found"* ]] || fail "missing adb was misreported as no devices" "$out"
+
+echo "PASS: launcher reports startup failures, isolates background launch logs, and detects USB devices"

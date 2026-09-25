@@ -8,7 +8,7 @@ Automate connecting your Android phone to ADB over a wireless connection, with a
 - **Android 11+ Wire-Free Pairing**: Pair over Wi-Fi using Android 11+ `adb pair` when no USB cable is available.
 - **Smart Dynamic IP Detection**: Prefers Wi-Fi/hotspot interfaces (`wlan0`, `wlan1`, `ap0`, …), skips cellular/carrier-NAT IPs that are unreachable from your PC, and pings candidates to confirm reachability. If ICMP is blocked or ping fails, falls back to the first suitable Wi-Fi address.
 - **Multi-Device Selector**: Displays an interactive menu if multiple USB devices are attached.
-- **scrcpy Launcher (`scrcpy.sh`)**: Standalone script with interactive resolution and FPS selection menus.
+- **scrcpy Launcher (`scrcpy.sh`)**: Standalone script with interactive resolution and FPS selection menus. Works with USB and wireless devices.
 - **Dedicated Cleanup (`stop.sh`)**: Interactive or non-interactive wireless session disconnect and ADB server restart tool.
 - **CLI Options**: Supports non-interactive flags like `--port`, `--all`, and `--kill`.
 
@@ -84,17 +84,23 @@ Options:
 
 ### Launching Screen Mirroring (scrcpy)
 
-After connecting wirelessly, run:
+Works with any connected device — USB or wireless. Plug in a phone and run it
+directly, or connect wirelessly first and run it after:
 
 ```bash
 ./scrcpy.sh
 ```
 
 The script will:
-1. Detect connected wireless ADB devices
-2. Prompt you to select resolution (1280/800/640/Original)
-3. Prompt you to select frame rate (60/30/Default)
-4. Show keyboard shortcuts and launch scrcpy
+1. Detect connected ADB devices (USB, wireless, and emulators)
+2. Prompt you to pick one if several are connected
+3. Prompt you to select resolution (1280/800/640/Original)
+4. Prompt you to select frame rate (60/30/Default)
+5. Show keyboard shortcuts and launch scrcpy
+
+If a device shows up as `unauthorized` or `offline`, the script names it and
+prints the matching fix (accept the USB debugging prompt, or replug the cable)
+instead of reporting that no device was found.
 
 #### CLI Options for `scrcpy.sh`:
 ```bash
@@ -102,7 +108,7 @@ The script will:
 
 Options:
   -a, --args ...     Pass custom arguments to scrcpy (must be final option, skips prompts)
-  -s, --serial S      Specify device serial (e.g. 192.168.1.50:5555)
+  -s, --serial S      Specify device serial (USB id like 422ae881, or ip:port)
   -h, --help          Show help message
 ```
 
