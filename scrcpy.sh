@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-set -e
+set -eu
 
 GREEN='\033[0;32m'
 YELLOW='\033[1;33m'
@@ -34,18 +34,28 @@ while [[ "$#" -gt 0 ]]; do
         show_help
         exit 1
       fi
+      # --args swallows the rest of the command line, so a second -a/--serial
+      # can only ever arrive inside the first batch: reject it there instead of
+      # silently discarding the arguments already collected.
       for _a in "$@"; do
-        if [[ "$_a" == "-s" || "$_a" == "--serial" ]]; then
-          echo -e "${YELLOW}[!] -s/--serial must come before -a/--args.${NC}"
-          show_help
-          exit 1
-        fi
+        case "$_a" in
+          -s|--serial)
+            echo -e "${YELLOW}[!] -s/--serial must come before -a/--args.${NC}"
+            show_help
+            exit 1
+            ;;
+          -a|--args)
+            echo -e "${YELLOW}[!] Option -a/--args may only be given once; a second occurrence would discard the first batch of arguments.${NC}"
+            show_help
+            exit 1
+            ;;
+        esac
       done
       SCRCPY_ARGS=("$@")
       shift "$#"
       ;;
     -s|--serial)
-      if [[ -z "$2" || "$2" =~ ^- ]]; then
+      if [[ -z "${2:-}" || "${2:-}" =~ ^- ]]; then
         echo -e "${YELLOW}[!] Option $1 requires a device serial.${NC}"
         show_help
         exit 1
@@ -80,7 +90,20 @@ check_scrcpy() {
     echo -e "${YELLOW}  After installing, re-run this script.${NC}"
     exit 1
   fi
-  echo -e "${GREEN}[✓] scrcpy detected${NC}"
+  # A failed probe only means the version is unknown, not that scrcpy is
+  # unusable, so warn and let launch_scrcpy report any real failure.
+  local probe version
+  probe=$(scrcpy --version 2>/dev/null) || probe=""
+  version="${probe%%$'\n'*}"
+  version="${version#scrcpy }"
+
+  if [[ -n "$version" ]]; then
+    echo -e "${GREEN}[✓] scrcpy detected (version ${version})${NC}"
+  else
+    echo -e "${YELLOW}[!] Could not determine the scrcpy version; continuing anyway.${NC}"
+    echo "  Run 'scrcpy --version' yourself to check the install."
+    echo -e "${GREEN}[✓] scrcpy detected${NC}"
+  fi
 }
 
 check_adb() {
@@ -88,9 +111,9 @@ check_adb() {
     echo -e "${YELLOW}[!] adb not found on this system.${NC}"
     echo ""
     echo "  Install Android platform tools:"
-    echo "    pkexec apt install adb               # Debian/Ubuntu/Pop!_OS"
-    echo "    pkexec dnf install android-tools       # Fedora"
-    echo "    pkexec pacman -S android-tools        # Arch"
+    echo "    pkexec apt install adb              # Debian/Ubuntu/Pop!_OS"
+    echo "    pkexec dnf install android-tools    # Fedora"
+    echo "    pkexec pacman -S android-tools      # Arch"
     echo ""
     echo -e "${YELLOW}  After installing, re-run this script.${NC}"
     exit 1
@@ -130,7 +153,7 @@ _sorted_devices() {
 
 detect_device() {
   if [[ -n "$DEVICE_SERIAL" ]]; then
-    if ! _connected_devices | grep -q "^${DEVICE_SERIAL}$"; then
+    if ! _connected_devices | grep -Fxq -- "$DEVICE_SERIAL"; then
       echo -e "${YELLOW}[!] Specified device $DEVICE_SERIAL is not connected or not authorized.${NC}"
       echo ""
       echo "  Usable devices:"
