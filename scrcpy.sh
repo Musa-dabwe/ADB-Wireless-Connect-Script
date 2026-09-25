@@ -72,9 +72,9 @@ check_scrcpy() {
     echo -e "${YELLOW}[!] scrcpy not found on this system.${NC}"
     echo ""
     echo "  Install scrcpy:"
-    echo "    sudo apt install scrcpy              # Debian/Ubuntu/Pop!_OS"
-    echo "    sudo dnf install scrcpy              # Fedora"
-    echo "    sudo pacman -S scrcpy                # Arch"
+    echo "    pkexec apt install scrcpy           # Debian/Ubuntu/Pop!_OS"
+    echo "    pkexec dnf install scrcpy           # Fedora"
+    echo "    pkexec pacman -S scrcpy             # Arch"
     echo ""
     echo -e "${YELLOW}  After installing, re-run this script.${NC}"
     exit 1
@@ -177,8 +177,33 @@ launch_scrcpy() {
   if [[ ${#SCRCPY_ARGS[@]} -gt 0 ]]; then
     echo -e "${CYAN}    Args: ${SCRCPY_ARGS[*]}${NC}"
   fi
-  nohup scrcpy -s "$DEVICE_SERIAL" "${SCRCPY_ARGS[@]}" >/dev/null 2>&1 &
-  echo -e "${GREEN}[✓] scrcpy started (PID: $!)${NC}"
+
+  local log_dir log_file scrcpy_pid exit_status
+  log_dir="${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/adb-wireless-connect"
+  mkdir -p "$log_dir"
+  log_file=$(mktemp "$log_dir/scrcpy.XXXXXX.log")
+
+  nohup scrcpy -s "$DEVICE_SERIAL" "${SCRCPY_ARGS[@]}" >"$log_file" 2>&1 &
+  scrcpy_pid=$!
+
+  sleep 1.25
+  if ! kill -0 "$scrcpy_pid" 2>/dev/null; then
+    set +e
+    wait "$scrcpy_pid"
+    exit_status=$?
+    set -e
+    [[ $exit_status -ne 0 ]] || exit_status=1
+
+    echo -e "${YELLOW}[!] scrcpy failed to start (status: $exit_status).${NC}"
+    if [[ -s "$log_file" ]]; then
+      sed 's/^/    /' "$log_file"
+    fi
+    echo -e "${CYAN}    Log: $log_file${NC}"
+    return "$exit_status"
+  fi
+
+  echo -e "${GREEN}[✓] scrcpy started and passed the startup check (PID: $scrcpy_pid)${NC}"
+  echo -e "${CYAN}    Log: $log_file${NC}"
 }
 
 main() {
@@ -195,7 +220,7 @@ main() {
   launch_scrcpy
 
   echo ""
-  echo -e "${GREEN}  Done! Enjoy screen mirroring.${NC}"
+  echo -e "${GREEN}  Launcher finished. Check the scrcpy window or log for runtime status.${NC}"
 }
 
 main
