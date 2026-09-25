@@ -11,6 +11,13 @@ DISCONNECT_ALL=false
 check_adb() {
   if ! command -v adb &>/dev/null; then
     echo -e "${YELLOW}[!] adb not found on this system.${NC}"
+    echo ""
+    echo "  Install ADB:"
+    echo "    pkexec apt install adb             # Debian/Ubuntu/Pop!_OS"
+    echo "    pkexec dnf install android-tools   # Fedora"
+    echo "    pkexec pacman -S android-tools     # Arch"
+    echo ""
+    echo -e "${YELLOW}  After installing, re-run this script.${NC}"
     exit 1
   fi
 }
@@ -43,7 +50,7 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 print_banner() {
-  clear 2>/dev/null || true
+  echo ""
   echo -e "${CYAN}"
   echo "  ╔══════════════════════════════════════════════╗"
   echo "  ║        ADB Wireless Stop / Cleanup           ║"

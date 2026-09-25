@@ -40,25 +40,25 @@ chmod +x start.sh stop.sh scrcpy.sh
 **ADB (Required)**
 ```bash
 # Debian / Ubuntu / Pop!_OS
-sudo apt install adb
+pkexec apt install adb
 
 # Fedora / RHEL
-sudo dnf install android-tools
+pkexec dnf install android-tools
 
 # Arch / Manjaro
-sudo pacman -S android-tools
+pkexec pacman -S android-tools
 ```
 
 **scrcpy (Optional — for Screen Mirroring)**
 ```bash
-# Debian / Ubuntu / Pop!_OS (or use pkexec)
-sudo apt install scrcpy
+# Debian / Ubuntu / Pop!_OS
+pkexec apt install scrcpy
 
 # Fedora / RHEL
-sudo dnf install scrcpy
+pkexec dnf install scrcpy
 
 # Arch / Manjaro
-sudo pacman -S scrcpy
+pkexec pacman -S scrcpy
 ```
 
 ---
@@ -107,7 +107,7 @@ instead of reporting that no device was found.
 ./scrcpy.sh [options]
 
 Options:
-  -a, --args ...     Pass custom arguments to scrcpy (must be final option, skips prompts)
+  -a, --args ...      Pass custom arguments to scrcpy (must be final option, skips prompts)
   -s, --serial S      Specify device serial (USB id like 422ae881, or ip:port)
   -h, --help          Show help message
 ```

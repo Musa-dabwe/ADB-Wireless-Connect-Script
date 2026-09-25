@@ -59,7 +59,7 @@ while [[ "$#" -gt 0 ]]; do
 done
 
 print_banner() {
-  clear 2>/dev/null || true
+  echo ""
   echo -e "${CYAN}"
   echo "  ╔══════════════════════════════════════════════╗"
   echo "  ║          scrcpy Launcher Script              ║"
