@@ -291,13 +291,40 @@ every item traced to a specific function in a specific script.
     quietly dropped.
   - File: start.sh
   - Status: PENDING
+- **Bug HS-022**: the two interactive restart branches in `stop.sh` have no error
+  handling.
+  - Root cause: `adb kill-server` and `adb start-server` are unguarded at
+    `stop.sh:142-143` and `stop.sh:184-185`, so a failure exits under `set -e`
+    with only adb's raw stderr. The `-k` path at `stop.sh:112-113` *is* guarded,
+    so the gap is specific to the two interactive branches.
+  - Fix applied: **none — out of scope for a documentation task.** Found while
+    documenting, not while hardening: it was not identified during Tasks 1–5.
+  - File: stop.sh
+  - Status: PENDING
+- **Bug HS-023**: the two post-connect `adb devices` dumps in `start.sh` have no
+  error handling.
+  - Root cause: `start.sh:294` and `start.sh:302` are unguarded, so a failing
+    `adb devices` exits under `set -e` with no script-authored message. The one
+    at `start.sh:302` is the sharper: a failure there kills the script *before*
+    the `if` on the next line can print its "Device not showing as connected
+    wirelessly" diagnostic.
+  - Fix applied: **none — out of scope for a documentation task.** Also found
+    while documenting, not while hardening.
+  - File: start.sh
+  - Status: PENDING
+
+Between them, HS-021, HS-022, and HS-023 are the only unguarded adb invocations
+left in the three scripts — seven calls in five places, since each `stop.sh`
+branch makes two. Every other adb call is guarded by `if !`, by `|| true`, or by
+sitting inside an `if` condition.
 
 ## Testing Performed
 - **Unit Tests**: `bash tests/test_scrcpy_launcher.sh` — PASS, 4 case groups,
   approximately 56 seconds. `bash tests/test_start_stop.sh` — PASS, 5 case
-  groups, approximately 4 seconds. Both suites use mocked `adb` / `scrcpy` /
-  `ping` / `sleep` binaries on `PATH`; no case contacts a real device and no
-  case leaves a process running.
+  groups, approximately 4 seconds. Each suite mocks the tools it drives —
+  `test_scrcpy_launcher.sh` mocks `adb` and `scrcpy`, `test_start_stop.sh` mocks
+  `adb`, `ping`, and `sleep` — by placing them on `PATH`; no case contacts a real
+  device and no case leaves a process running.
 - **Regression Testing**: `bash -n` clean on all three scripts and both test
   files; the pre-existing `scrcpy.sh` assertions from `f51e986` pass unchanged at
   every one of the nine commits, including the four background-launch cases that
@@ -348,13 +375,24 @@ every item traced to a specific function in a specific script.
   `docs/feature-research/scrcpy-launch-failure.md` and had simply never been
   applied.
 - **`scrcpy.sh` runs `set -eu`; `start.sh` and `stop.sh` deliberately stay on
-  `set -e` alone.** Not an oversight and not an oversight to be cleaned up
-  later. `start.sh` reads its prompts with `read … || true`, which leaves the
-  variable *unset* when there is no tty, so a blanket `set -u` would abort the
-  no-tty path with `unbound variable` instead of applying the documented
-  default. Verified directly: `set -eu` plus a failed `read` plus a bare
-  expansion aborts; the same under `set -e` reaches the fallback.
-  `scrcpy.sh` can use `-u` because its prompts always assign a fallback.
+  `set -e` alone.** Not an oversight, and not an oversight to be cleaned up
+  later. The reason is `start.sh`'s, and it is specific: its Android 11+ pairing
+  prompts read with `read … || true`, which leaves `pair_addr` and `pair_code`
+  *unset* when there is no tty, and the next line expands them bare. A blanket
+  `set -u` therefore aborts the no-tty path with `pair_addr: unbound variable`
+  (`start.sh:138`) instead of applying the documented "Pairing details missing"
+  default. Verified by running a `set -eu` copy against a mock adb with no tty:
+  that is the exact failure, where the shipped `set -e` script prints the
+  default and exits 1. `scrcpy.sh` can use `-u` because its prompts always assign
+  a fallback.
+  `stop.sh` is a different case and is kept aligned rather than kept out of
+  necessity: it has no `|| true` read at all — both its prompts use
+  `|| choice="2"` and `|| choice="3"`, which *assign* — so `-u` would not break
+  its no-tty path. A `set -eu` copy reaches the documented default on both
+  interactive branches and exits 0. The warning worth keeping is therefore
+  narrow and specific: do not consolidate all three scripts onto `-eu`. It would
+  look safe, because `scrcpy.sh` and `stop.sh` would both survive it, and it
+  would break `start.sh`.
 - **Keep the default `scrcpy.sh` path non-blocking.** `--wait` is opt-in so that
   existing workflows and the pre-existing suite are untouched by the lifecycle
   work.
@@ -378,8 +416,8 @@ every item traced to a specific function in a specific script.
 - **Scrub every `MOCK_*` knob at suite startup.** This is a deliberate behaviour
   change: an exported `MOCK_ADB_CONNECT=fail` no longer probes a single
   behavior, because inside a bash function it is indistinguishable from a
-  per-case prefix assignment. The suite is green with all seven knobs exported
-  and red with the scrub removed.
+  per-case prefix assignment. The scrub loop unsets ten knobs, and the suite is
+  green with all ten exported and red with the scrub removed.
 - **No case selector.** Both suites can only run whole. Accepted for this pass
   and recorded as a follow-up.
 - **Leave `shellcheck` alone.** Worth doing, deliberately out of scope, recorded
@@ -411,16 +449,17 @@ external build export was produced.
 ## Performance Metrics
 - Regression test runtime: `tests/test_start_stop.sh` approximately 4 seconds;
   `tests/test_scrcpy_launcher.sh` approximately 56 seconds.
-- Change size across `037a402`..`85e4880` (Tasks 1–5; this documentation task's
-  own changes are not in this figure): 1784 insertions, 72 deletions across six
-  files — `scrcpy.sh` +273/-20, `start.sh` +78/-12, `stop.sh` +90/-23,
-  `tests/test_scrcpy_launcher.sh` +507/-9, `tests/test_start_stop.sh` +828 (new),
-  `README.md` +8/-8.
+- Change size across `f51e986`..`85e4880` — the nine commits of Tasks 1–5; this
+  documentation task's own changes are not in this figure: 1784 insertions, 72
+  deletions across six files — `scrcpy.sh` +273/-20, `start.sh` +78/-12,
+  `stop.sh` +90/-23, `tests/test_scrcpy_launcher.sh` +507/-9,
+  `tests/test_start_stop.sh` +828 (new), `README.md` +8/-8.
 - Current sizes: `scrcpy.sh` 546 lines, `start.sh` 346, `stop.sh` 194,
   `tests/test_scrcpy_launcher.sh` 691, `tests/test_start_stop.sh` 828.
 - Startup grace period: 1.25s hardcoded before, configurable with a 2s default
   now.
-- Log directory: unbounded before, at most 11 files per state directory now.
+- Log directory: unbounded before, at most 11 logs per state directory now,
+  plus the `scrcpy.pid` file that shares it.
 - Code complexity change: moderate increase in `scrcpy.sh` (session lifecycle)
   and in test code; `start.sh` and `stop.sh` grew only where a validation or an
   error path was added.
@@ -428,6 +467,10 @@ external build export was produced.
 ## Next Session Priorities
 - [ ] Guard `step_tcpip` in `start.sh`, with a `MOCK_ADB_TCPIP` failure knob and
   a case to gate it.
+- [ ] Guard the two interactive restart branches in `stop.sh`
+  (`stop.sh:142-143`, `stop.sh:184-185`) and the two `adb devices` dumps in
+  `start.sh` (`start.sh:294`, `start.sh:302`). Both groups were found while
+  documenting this pass, not during Tasks 1–5 — see Bugs HS-022 and HS-023.
 - [ ] Add a case selector to both harnesses so a single case can be run in
   isolation, and revisit the `MOCK_*` startup scrub alongside it.
 - [ ] Manually verify the new `start.sh` / `stop.sh` output against a real

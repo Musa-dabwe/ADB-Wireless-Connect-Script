@@ -11,7 +11,7 @@ Automate connecting your Android phone to ADB over a wireless connection, with a
 - **scrcpy Launcher (`scrcpy.sh`)**: Standalone script with interactive resolution and FPS selection menus. Works with USB and wireless devices. Tracks the session through a PID file, bounds the log directory, and can run in the foreground with `--wait` so a mid-session crash is visible.
 - **Dedicated Cleanup (`stop.sh`)**: Interactive or non-interactive wireless session disconnect and ADB server restart tool. Every wireless target is labelled with its real adb state, and a partial disconnect is never reported as success.
 - **CLI Options**: Supports non-interactive flags like `--port`, `--timeout`, `--wait`, `--force`, `--all`, and `--kill`.
-- **Input validation**: `--port` is checked at both of its input paths before adb ever sees it, and no failure path ends in a silent non-zero exit.
+- **Input validation**: `--port` is checked at both of its input paths before adb ever sees it, and the device pickers in both scripts fall back to the first device on bad input. A few adb calls are still unguarded — `adb tcpip` and two `adb devices` dumps in `start.sh`, and `adb kill-server` / `adb start-server` in `stop.sh`'s two interactive restart branches — so a failure at any of them exits with adb's own error but no explanation from the script. All of them are tracked as follow-ups in [`docs/BUILD.md`](docs/BUILD.md).
 
 ---
 
@@ -151,10 +151,12 @@ a running scrcpy (killed launcher, reboot, recycled PID) is treated as stale:
 it is overwritten, and never blocks a launch or signals a stranger's process.
 `--force` escalates from `SIGTERM` to `SIGKILL` after about a second.
 
-The log directory is the same `adb-wireless-connect` directory and holds one
-`scrcpy.*.log` per launch. The newest 10 are kept, plus the current launch's log
-whether or not it is among them; pruning runs on the failure path too, since a
-device that will not start is exactly when a user retries.
+The log directory is the same `adb-wireless-connect` directory, and holds one
+`scrcpy.*.log` per launch alongside `scrcpy.pid`. Pruning keeps the newest 10
+logs and always keeps the current launch's log, which is excluded from that count
+rather than competing with it — so the directory holds at most 11 logs plus the
+PID file. Pruning runs on the failure path too, since a device that will not
+start is exactly when a user retries.
 
 ---
 
@@ -195,9 +197,10 @@ reported as complete.
 
 ## 🧪 Tests
 
-Both suites are pure Bash and use mock `adb` / `scrcpy` / `ping` / `sleep`
-binaries on `PATH`, driven by `MOCK_*` environment variables. No case contacts a
-real device, and no case leaves a process running.
+Both suites are pure Bash and shadow the tools each one drives with mock binaries
+on `PATH`, driven by `MOCK_*` environment variables: the launcher suite mocks
+`adb` and `scrcpy`, and the `start.sh` / `stop.sh` suite mocks `adb`, `ping`, and
+`sleep`. No case contacts a real device, and no case leaves a process running.
 
 ```bash
 bash tests/test_scrcpy_launcher.sh   # scrcpy.sh
