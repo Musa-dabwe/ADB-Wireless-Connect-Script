@@ -333,39 +333,59 @@ _state_dir() {
   printf '%s\n' "${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/adb-wireless-connect"
 }
 
+# True only when the recorded PID is positively identified as a scrcpy process.
+# `kill -0` would only prove that *something* owns the PID: the PID file is
+# stranded by a SIGKILLed launcher, a reboot, or a plain scrcpy quit, and the
+# number it names may since have been recycled by an unrelated process. Reading
+# the command line is what makes the refusal and the --force kill safe.
+# Anything short of a positive match counts as "not our scrcpy".
+_process_is_scrcpy() {
+  local pid=$1 cmdline field
+  local -a fields=()
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  [[ -r "/proc/$pid/cmdline" ]] || return 1
+  # NUL-separated argv, so translate the separators before splitting.
+  cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null) || return 1
+  read -r -a fields <<<"$cmdline"
+  # Match a whole argument named scrcpy, not a substring: argv[0] for the real
+  # binary, argv[1] for the interpreter when scrcpy is a #! wrapper script.
+  for field in "${fields[@]}"; do
+    [[ "${field##*/}" == "scrcpy" ]] && return 0
+  done
+  return 1
+}
+
 # Refuse to start a second scrcpy against the same setup while one is already
-# running. A PID file whose process is gone is stale and never blocks a launch.
+# running. A PID file that does not positively identify a live scrcpy is stale
+# and never blocks a launch: overwriting a stale PID file is harmless, whereas
+# refusing or killing a stranger's process is not.
 _check_existing_session() {
   local pid_file=$1 recorded
   [[ -s "$pid_file" ]] || return 0
-  read -r recorded <"$pid_file" || recorded=""
-  # A PID file that does not hold a plain number cannot be probed; treat it as
-  # stale and let the launch overwrite it.
-  if [[ ! "$recorded" =~ ^[0-9]+$ ]]; then
+  # `read` returns non-zero for a file with no trailing newline even though it
+  # assigns the value, so a `|| recorded=""` fallback would discard a valid PID.
+  read -r recorded <"$pid_file" || true
+  # One gate for both decisions below: never refuse, and never signal, a process
+  # that is not positively identified as scrcpy.
+  _process_is_scrcpy "$recorded" || return 0
+
+  if [[ $SCRCPY_FORCE -eq 1 ]]; then
+    echo -e "${YELLOW}[!] --force given: stopping the scrcpy session already running (PID: $recorded).${NC}"
+    kill "$recorded" 2>/dev/null || true
+    _wait_for_exit "$recorded" || {
+      echo -e "${YELLOW}[!] Could not stop the scrcpy session (PID: $recorded).${NC}"
+      echo "  Run 'kill -9 $recorded' by hand, then re-run this script."
+      return 1
+    }
     return 0
   fi
 
-  if kill -0 "$recorded" 2>/dev/null; then
-    if [[ $SCRCPY_FORCE -eq 1 ]]; then
-      echo -e "${YELLOW}[!] --force given: stopping the scrcpy session already running (PID: $recorded).${NC}"
-      kill "$recorded" 2>/dev/null || true
-      _wait_for_exit "$recorded" || {
-        echo -e "${YELLOW}[!] Could not stop the scrcpy session (PID: $recorded).${NC}"
-        echo "  Run 'kill -9 $recorded' by hand, then re-run this script."
-        return 1
-      }
-      return 0
-    fi
-    echo -e "${YELLOW}[!] A scrcpy session is already running (PID: $recorded).${NC}"
-    echo ""
-    echo "  Stop it first:  kill $recorded"
-    echo "  Or re-run with --force to stop it and start a new one."
-    echo -e "${CYAN}  PID file: $pid_file${NC}"
-    return 1
-  fi
-
-  # Stale PID file: the process is gone, so overwrite it silently below.
-  return 0
+  echo -e "${YELLOW}[!] A scrcpy session is already running (PID: $recorded).${NC}"
+  echo ""
+  echo "  Stop it first:  kill $recorded"
+  echo "  Or re-run with --force to stop it and start a new one."
+  echo -e "${CYAN}  PID file: $pid_file${NC}"
+  return 1
 }
 
 # Give a signalled process a moment to go away, then insist.
@@ -443,7 +463,17 @@ launch_scrcpy() {
     return 1
   fi
 
-  log_file=$(mktemp "$log_dir/scrcpy.XXXXXX.log")
+  # An unwritable or missing state directory must be reported as itself. Left
+  # unguarded, mktemp's failure leaves log_file empty and the launch goes on to
+  # blame scrcpy for a failure that never happened.
+  if ! log_file=$(mktemp "$log_dir/scrcpy.XXXXXX.log"); then
+    echo -e "${YELLOW}[!] Could not create a log file in $log_dir.${NC}"
+    echo ""
+    echo "  The state directory must exist and be writable. Check it with:"
+    echo "    ls -ld '$log_dir'"
+    echo "  Fix that, or point XDG_STATE_HOME somewhere writable, then re-run."
+    return 1
+  fi
 
   if [[ $SCRCPY_WAIT -eq 1 ]]; then
     echo -e "${CYAN}    Running in the foreground; press Ctrl+C or close the scrcpy window to stop.${NC}"
@@ -475,6 +505,9 @@ launch_scrcpy() {
       sed 's/^/    /' "$log_file"
     fi
     echo -e "${CYAN}    Log: $log_file${NC}"
+    # Prune here too: a device that fails to start is exactly the case where a
+    # user retries, and the log directory has to stay bounded either way.
+    _prune_logs 10 "$log_file" "$log_dir"
     rm -f "$pid_file"
     return "$exit_status"
   fi

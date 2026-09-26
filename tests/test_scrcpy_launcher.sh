@@ -200,6 +200,20 @@ new_state_dir() {
   printf '%s\n' "$dir"
 }
 
+# Fill a log directory with $2 scrcpy.*.log files, all dated an hour into the
+# future so every one of them is newer than the launch that follows. That makes
+# the launch's own log the OLDEST of them all, which is the only arrangement in
+# which "never delete the current log" is actually load-bearing.
+seed_future_logs() {
+  local dir=$1 count=$2 i base
+  mkdir -p "$dir"
+  base=$(( $(date +%s) + 3600 ))
+  for i in $(seq 1 "$count"); do
+    : >"$dir/scrcpy.seed$i.log"
+    touch -d "@$(( base + i ))" "$dir/scrcpy.seed$i.log"
+  done
+}
+
 extract_log_path() {
   sed $'s/\033\\[[0-9;]*m//g' | sed -n 's/.*Log: //p' | tail -n 1
 }
@@ -451,6 +465,10 @@ refuse_pid_file=$(launcher_pid_file "$refuse_state")
 [[ "$output" == *"PID file: $refuse_pid_file"* ]] ||
   fail "the launch did not print the PID file path" "$output"
 
+# Rewrite the PID file with no trailing newline: `read` returns non-zero for
+# such a file even though it assigns the value, and a `|| recorded=""` style
+# fallback would silently discard the PID and let this launch through.
+printf '%s' "$running_pid" >"$refuse_pid_file"
 output=$(CASE_STATE_HOME="$refuse_state" run_case running refuseb "$WIRELESS_DEVICES" \
   --serial 192.168.70.125:5555 --timeout 0.3 --args --no-audio)
 status=$?
@@ -520,6 +538,44 @@ stale_live_pid=$(cat "$TEST_DIR/scrcpy-stale.pid")
   fail "the stale PID file was not overwritten with the new session" "$output"
 stop_mock_scrcpy stale
 
+# The PID file is only removed on a clean --wait exit or a detected startup
+# failure, so a SIGKILLed launcher, a reboot, or a plain scrcpy quit all strand
+# it and the number in it can be recycled by an unrelated process. Liveness is
+# not identity: a live process that is not scrcpy must be treated as stale.
+foreign_state=$(new_state_dir foreign)
+sleep 300 &
+foreign_pid=$!
+# Registered under the pid-file glob the EXIT trap reaps, so a failing
+# assertion here cannot orphan it either.
+printf '%s\n' "$foreign_pid" >"$TEST_DIR/scrcpy-foreignhold.pid"
+kill -0 "$foreign_pid" 2>/dev/null || fail "the stand-in process did not start"
+seed_launcher_pid_file "$foreign_state" "$foreign_pid"
+output=$(CASE_STATE_HOME="$foreign_state" run_case running foreign "$WIRELESS_DEVICES" \
+  --serial 192.168.70.125:5555 --timeout 0.3 --args --no-audio)
+status=$?
+[[ $status -eq 0 ]] || fail "a live non-scrcpy PID blocked the launch (status $status)" "$output"
+[[ "$output" != *"already running"* ]] ||
+  fail "a live non-scrcpy PID was reported as a scrcpy session" "$output"
+[[ "$output" == *"scrcpy started"* ]] || fail "the launch over an unidentifiable PID file did not start" "$output"
+kill -0 "$foreign_pid" 2>/dev/null || fail "the launch killed an unrelated process" "$output"
+[[ -s "$TEST_DIR/scrcpy-foreign.pid" ]] || fail "the launch over an unidentifiable PID file started nothing" "$output"
+[[ "$(cat "$TEST_DIR/scrcpy-foreign.pid")" != "$foreign_pid" ]] ||
+  fail "the unidentifiable PID file was not overwritten" "$output"
+stop_mock_scrcpy foreign
+
+# --force must not signal a process it has not identified as scrcpy either.
+seed_launcher_pid_file "$foreign_state" "$foreign_pid"
+output=$(CASE_STATE_HOME="$foreign_state" run_case running foreignf "$WIRELESS_DEVICES" \
+  --serial 192.168.70.125:5555 --force --timeout 0.3 --args --no-audio)
+status=$?
+[[ $status -eq 0 ]] || fail "--force refused over an unidentifiable PID (status $status)" "$output"
+[[ "$output" != *"--force given"* ]] ||
+  fail "--force claimed to stop a process it never identified as scrcpy" "$output"
+[[ "$output" == *"scrcpy started"* ]] || fail "--force did not start a new session" "$output"
+kill -0 "$foreign_pid" 2>/dev/null || fail "--force killed an unrelated process" "$output"
+stop_mock_scrcpy foreignf
+stop_pid "$foreign_pid"
+
 # --wait hands scrcpy's own status back and takes the PID file with it. The
 # seeded PID file proves the file was written and then removed, rather than
 # never having existed.
@@ -552,13 +608,7 @@ status=$?
 # and the current launch's log survives even when it is the oldest of them all.
 prune_state=$(new_state_dir prune)
 prune_dir="$prune_state/adb-wireless-connect"
-mkdir -p "$prune_dir"
-# Dated an hour ahead so every seeded log is newer than the launch that follows.
-prune_base=$(( $(date +%s) + 3600 ))
-for i in $(seq 1 15); do
-  : >"$prune_dir/scrcpy.seed$i.log"
-  touch -d "@$(( prune_base + i ))" "$prune_dir/scrcpy.seed$i.log"
-done
+seed_future_logs "$prune_dir" 15
 output=$(CASE_STATE_HOME="$prune_state" run_case running prune "$WIRELESS_DEVICES" \
   --serial 192.168.70.125:5555 --timeout 0.3 --args --no-audio)
 status=$?
@@ -576,6 +626,38 @@ for i in $(seq 6 15); do
   [[ -e "$prune_dir/scrcpy.seed$i.log" ]] || fail "a recent log (seed$i) was pruned" "$output"
 done
 stop_mock_scrcpy prune
+
+# A launch that fails is exactly the case where a user retries, so the log
+# directory has to stay bounded on the failure path too.
+failprune_state=$(new_state_dir failprune)
+failprune_dir="$failprune_state/adb-wireless-connect"
+seed_future_logs "$failprune_dir" 15
+output=$(CASE_STATE_HOME="$failprune_state" run_case immediate failprune "$WIRELESS_DEVICES" \
+  --serial 192.168.70.125:5555 --timeout 0.3 --args --no-audio)
+status=$?
+[[ $status -eq 42 ]] || fail "the failing launch for the prune case returned $status; expected 42" "$output"
+failed_prune_log=$(extract_log_path <<<"$output")
+[[ -s "$failed_prune_log" ]] || fail "the failed launch's own log was pruned away" "$output"
+failed_kept=$(ls -1 "$failprune_dir"/scrcpy.*.log | wc -l)
+[[ $failed_kept -eq 11 ]] ||
+  fail "a failed launch left $failed_kept logs; expected the current log plus 10 kept" "$output"
+[[ ! -e "$failprune_dir/scrcpy.seed1.log" ]] || fail "a failed launch did not prune an old log" "$output"
+[[ -e "$failprune_dir/scrcpy.seed15.log" ]] || fail "a failed launch pruned a recent log" "$output"
+
+# A state directory that cannot be written must be reported as itself, not as a
+# scrcpy startup failure. A regular file where the directory should be makes
+# mkdir and mktemp fail the same way on any uid, root included.
+printf 'not a directory\n' >"$TEST_DIR/blocker"
+output=$(CASE_STATE_HOME="$TEST_DIR/blocker" run_case running blocked "$WIRELESS_DEVICES" \
+  --serial 192.168.70.125:5555 --timeout 0.3 --args --no-audio)
+status=$?
+[[ $status -eq 1 ]] || fail "an unwritable state directory returned $status; expected 1" "$output"
+[[ "$output" == *"Could not create a log file"* ]] ||
+  fail "an unwritable state directory was not reported" "$output"
+[[ "$output" == *"ls -ld"* ]] || fail "the unwritable-directory message gives no next step" "$output"
+[[ "$output" != *"scrcpy failed to start"* ]] ||
+  fail "an unwritable state directory was misreported as a scrcpy failure" "$output"
+[[ ! -e "$TEST_DIR/scrcpy-blocked.pid" ]] || fail "an unwritable state directory still started scrcpy" "$output"
 
 # A zero-padded answer at the device picker (08) must not be read as an invalid
 # octal number. The picker reads /dev/tty, so this case needs a real pty; util-
@@ -605,4 +687,5 @@ else
 fi
 
 echo "PASS: launcher validates --timeout, guards and overrides a live session, propagates --wait status, and bounds the log directory"
+echo "PASS: launcher trusts a PID file only when /proc identifies it as scrcpy, and bounds the log directory on failure too"
 
