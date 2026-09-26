@@ -22,6 +22,20 @@ _normalize_number() {
   printf '%s\n' "$value"
 }
 
+# The single port check, shared by both ways of setting PORT (the --port flag and
+# the Android 11+ pairing prompt) so the two input paths cannot drift. Prints the
+# normalized port and returns 0, or returns 1 without printing on rejection.
+# The length test comes first on purpose: bash arithmetic is 64-bit and wraps, so
+# 18446744073709557171 (2^64 + 5555) compares as 5555 and would slip through a
+# range check alone.
+_valid_port() {
+  local value
+  value=$(_normalize_number "$1")
+  [[ "$value" =~ ^[0-9]{1,5}$ ]] || return 1
+  (( value >= 1024 && value <= 65535 )) || return 1
+  printf '%s\n' "$value"
+}
+
 show_help() {
   echo -e "${CYAN}ADB Wireless Connect - start.sh${NC}"
   echo ""
@@ -43,10 +57,9 @@ while [[ "$#" -gt 0 ]]; do
         show_help
         exit 1
       fi
-      # Validate here instead of letting "adb tcpip <junk>" fail later with
+      # Validate here instead of letting "adb connect <junk>" fail later with
       # adb's own terse error, and so the message can name the bad value.
-      _port_norm=$(_normalize_number "$_port_arg")
-      if [[ ! "$_port_norm" =~ ^[0-9]+$ ]] || (( _port_norm < 1024 || _port_norm > 65535 )); then
+      if ! _port_norm=$(_valid_port "$_port_arg"); then
         echo -e "${YELLOW}[!] Invalid port: $_port_arg (must be a number between 1024 and 65535).${NC}"
         show_help
         exit 1
@@ -99,8 +112,11 @@ detect_usb_device() {
       echo "    $((i+1))) ${devices[$i]}"
     done
     read -rp "  Select device number [1-${#devices[@]}, default: 1]: " choice </dev/tty || choice=1
-    # Unvalidated input would flow into "adb -s '' ..."; fall back to the first
-    # device for anything that is not a whole number or is out of range.
+    # Guard the index, not just the shape. Unvalidated input yields idx=-1, and
+    # bash resolves a negative subscript to the LAST device — so garbage here
+    # silently connects to the wrong phone rather than failing. Non-integer
+    # input is worse: it dies inside arithmetic under set -e with a bare bash
+    # error and no script message at all.
     choice=$(_normalize_number "$choice")
     [[ "$choice" =~ ^[0-9]+$ ]] || choice=1
     local idx=$((choice-1))
@@ -130,9 +146,19 @@ handle_android11_pairing() {
     fi
     echo -e "${GREEN}[✓] Pairing successful!${NC}"
     echo ""
-    read -rp "  Enter target Connect Port shown on main Wireless Debugging page [default: $PORT]: " target_port </dev/tty || target_port="$PORT"
+    # This prompt is the second way of setting PORT, so it gets the same check
+    # as --port; an empty answer keeps the already-validated $PORT. Without it a
+    # typo here reaches "adb connect <ip>:<junk>" and burns two attempts before
+    # step_connect reports the failure.
+    read -rp "  Enter target Connect Port shown on main Wireless Debugging page [default: $PORT]: " target_port </dev/tty || target_port=""
+    if [[ -n "$target_port" ]]; then
+      if ! _prompt_port=$(_valid_port "$target_port"); then
+        echo -e "${YELLOW}[!] Invalid port: $target_port (must be a number between 1024 and 65535).${NC}"
+        exit 1
+      fi
+      PORT="$_prompt_port"
+    fi
     DEVICE_IP="${pair_addr%%:*}"
-    PORT="${target_port:-$PORT}"
   else
     echo -e "${YELLOW}[!] Pairing details missing. Exiting.${NC}"
     exit 1

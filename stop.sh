@@ -56,10 +56,51 @@ print_banner() {
 # Read one serial's state out of a cached "adb devices" dump. A serial that is
 # not in the dump is still a wireless target (the filter matches on the serial
 # alone), so it is reported as "unknown" rather than presented as active.
+# The whole remainder of the line is the status, not just the second field: adb
+# also reports things like "no permissions (user in plugdev group); see [...]",
+# and taking only $2 would render that as the nonsense label "(no)".
 _device_state() {
   local serial=$1 dump=$2 state
-  state=$(printf '%s\n' "$dump" | awk -v s="$serial" 'NR>1 && $1 == s { print $2; exit }')
+  state=$(printf '%s\n' "$dump" | awk -v s="$serial" \
+    'NR>1 && $1 == s { sub(/^[^ \t]+[ \t]+/, ""); print; exit }')
   printf '%s\n' "${state:-unknown}"
+}
+
+# Disconnect every serial passed in, and never let one failure abandon the
+# targets after it: "adb disconnect" returns non-zero for a target adb has
+# already dropped ("error: no such device"), and after the state labels above,
+# cleaning up exactly those stale targets is a normal thing to do. Each failure
+# is collected and reported at the end; the return value is 0 only when every
+# target was disconnected.
+disconnect_targets() {
+  local -a failed=()
+  local dev out
+  for dev in "$@"; do
+    echo -e "${YELLOW}[*] Disconnecting $dev...${NC}"
+    if ! out=$(adb disconnect "$dev" 2>&1); then
+      failed+=("$dev")
+      # An explicit if, not "[[ ... ]] && echo": adb can fail without saying
+      # why, and an empty $out must not become the loop body's exit status.
+      if [[ -n "$out" ]]; then
+        echo "    $out"
+      fi
+    fi
+  done
+
+  if [[ ${#failed[@]} -eq 0 ]]; then
+    return 0
+  fi
+
+  echo ""
+  echo -e "${YELLOW}[!] Could not disconnect ${#failed[@]} of $# target(s):${NC}"
+  for dev in "${failed[@]}"; do
+    echo "    • $dev"
+  done
+  echo ""
+  echo "  adb may already have dropped these targets, which is harmless."
+  echo "  To clear every target, restart the server:"
+  echo "    adb kill-server && adb start-server"
+  return 1
 }
 
 main() {
@@ -116,12 +157,11 @@ main() {
   echo ""
 
   if $DISCONNECT_ALL; then
-    for dev in "${wireless_devices[@]}"; do
-      echo -e "${YELLOW}[*] Disconnecting $dev...${NC}"
-      adb disconnect "$dev"
-    done
-    echo -e "${GREEN}[✓] All wireless ADB connections disconnected.${NC}"
-    exit 0
+    if disconnect_targets "${wireless_devices[@]}"; then
+      echo -e "${GREEN}[✓] All wireless ADB connections disconnected.${NC}"
+      return 0
+    fi
+    return 1
   fi
 
   echo "Select an action:"
@@ -133,11 +173,11 @@ main() {
 
   case "$choice" in
     1)
-      for dev in "${wireless_devices[@]}"; do
-        echo -e "${YELLOW}[*] Disconnecting $dev...${NC}"
-        adb disconnect "$dev"
-      done
-      echo -e "${GREEN}[✓] Disconnected.${NC}"
+      if disconnect_targets "${wireless_devices[@]}"; then
+        echo -e "${GREEN}[✓] Disconnected.${NC}"
+      else
+        return 1
+      fi
       ;;
     2)
       echo -e "${YELLOW}[*] Restarting ADB server...${NC}"
