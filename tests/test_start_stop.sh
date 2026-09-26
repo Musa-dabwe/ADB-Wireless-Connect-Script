@@ -8,13 +8,27 @@ set -u
 # Two properties this harness guarantees:
 #   * No case can reach a real device. adb is the only way either script touches
 #     hardware, and it is shadowed by a mock for every case.
-#   * No case can leave a process running. Every child is a foreground `timeout`,
-#     so there is nothing to reap even when an assertion fails; the pid sweep in
-#     cleanup is a backstop for a future case that does background something.
+#   * No case can leave a process running. Every child is a foreground `timeout`
+#     in a command substitution, so nothing is backgrounded to begin with — see
+#     cleanup for why there is no pid sweep.
 
 ROOT_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 TEST_DIR=$(mktemp -d)
 BASE_PATH=$PATH
+
+# Clear every mock knob the suite knows about, before any case runs. Inside the
+# runners `${MOCK_X:-default}` honours a case's own prefix assignment
+# (`MOCK_ADB_CONNECT=fail run_script …`) and falls back to the default
+# otherwise — but a knob the developer happened to have exported
+# (`MOCK_ADB_CONNECT=fail bash tests/test_start_stop.sh`) is indistinguishable
+# from such an assignment once the function is running, and would silently drive
+# every case with no override of its own into the failure path. Scrubbing here
+# makes "a value can only come from the case that wanted it" true.
+for knob in MOCK_ADB_DEVICES MOCK_ADB_SHELL_ADDR MOCK_ADB_PAIR MOCK_ADB_CONNECT \
+  MOCK_ADB_KILL_SERVER MOCK_ADB_DISCONNECT_FAIL MOCK_PING MOCK_PING_FAIL \
+  MOCK_ADB_CALL_LOG MOCK_SLEEP_LOG; do
+  unset "$knob"
+done
 
 mkdir -p "$TEST_DIR/bin" "$TEST_DIR/home"
 
@@ -104,11 +118,20 @@ EOF
 
 cat >"$TEST_DIR/bin/ping" <<'EOF'
 #!/usr/bin/env bash
-# MOCK_PING=fail drives the "no reachable candidate" fallback in step_get_ip.
+# MOCK_PING=fail makes every candidate unreachable.
+# MOCK_PING_FAIL lists individual addresses that must not answer, which is what
+# separates "the first candidate" from "the first reachable candidate".
+addr=${*: -1}
 if [[ "${MOCK_PING:-ok}" == "fail" ]]; then
-  echo "ping: ${*: -1}: connect: Network is unreachable" >&2
+  echo "ping: $addr: connect: Network is unreachable" >&2
   exit 1
 fi
+for bad in ${MOCK_PING_FAIL:-}; do
+  if [[ "$bad" == "$addr" ]]; then
+    echo "ping: $addr: connect: Network is unreachable" >&2
+    exit 1
+  fi
+done
 exit 0
 EOF
 
@@ -118,6 +141,14 @@ cat >"$TEST_DIR/bin/sleep" <<'EOF'
 # stubbing it keeps the suite in the seconds range. Every child is still wrapped
 # in `timeout`, so a real sleep creeping back in shows up as a slow case rather
 # than as a hung one.
+#
+# Recording the requested durations is what lets a case assert that the stub is
+# the sleep that ran. A wall-clock bound cannot: the happy path only ever spends
+# the 2s, which is inside the noise of a loaded machine, so "the suite was fast"
+# is not evidence that anything was stubbed.
+if [[ -n "${MOCK_SLEEP_LOG:-}" ]]; then
+  printf '%s\n' "$*" >>"$MOCK_SLEEP_LOG"
+fi
 exit 0
 EOF
 
@@ -133,6 +164,28 @@ IP_ADDR_FIXTURE="1: lo: <LOOPBACK> mtu 65536
     inet 10.132.19.5/23 scope global rmnet_data0
 3: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500
     inet 192.168.139.208/24 brd 192.168.139.255 scope global wlan0"
+
+# Two addresses on one Wi-Fi interface, both pingable. Which one is chosen is
+# only observable if BOTH are already in the device dump, otherwise a run that
+# picked the second would fail the final verification for the wrong reason and
+# the assertion would stop discriminating.
+IP_ADDR_TWO_WIFI="3: wlan0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500
+    inet 192.168.139.208/24 brd 192.168.139.255 scope global wlan0
+    inet 192.168.139.209/24 brd 192.168.139.255 scope global wlan0"
+
+BOTH_WIFI_DEVICES="List of devices attached
+422ae881               device usb:2-3
+192.168.139.208:5555   device
+192.168.139.209:5555   device"
+
+# An unknown interface carrying a private address and no Wi-Fi at all. The `*)`
+# arm of the interface filter is the only thing that can reject this one: it is
+# neither a recognised Wi-Fi interface nor a recognised cellular one, so
+# is_unreachable_ip decides. With nothing else left, a candidate that survives
+# the filter becomes the target; one that does not leaves step_get_ip with no
+# address at all.
+IP_ADDR_PRIVATE_UNKNOWN="2: eth0: <BROADCAST,MULTICAST,UP,LOWER_UP> mtu 1500
+    inet 10.8.0.5/24 brd 10.8.0.255 scope global eth0"
 
 # One USB device already visible as a wireless target, so the post-tcpip
 # verification can succeed.
@@ -202,7 +255,7 @@ fi
 run_script() {
   local script=$1 tag=$2 devices=$3
   shift 3
-  rm -f "$TEST_DIR/calls-$tag.log"
+  rm -f "$TEST_DIR/calls-$tag.log" "$TEST_DIR/sleeps-$tag.log"
   env MOCK_ADB_DEVICES="$devices" \
     MOCK_ADB_SHELL_ADDR="${MOCK_ADB_SHELL_ADDR:-$IP_ADDR_FIXTURE}" \
     MOCK_ADB_PAIR="${MOCK_ADB_PAIR:-ok}" \
@@ -210,7 +263,9 @@ run_script() {
     MOCK_ADB_KILL_SERVER="${MOCK_ADB_KILL_SERVER:-ok}" \
     MOCK_ADB_DISCONNECT_FAIL="${MOCK_ADB_DISCONNECT_FAIL:-}" \
     MOCK_PING="${MOCK_PING:-ok}" \
+    MOCK_PING_FAIL="${MOCK_PING_FAIL:-}" \
     MOCK_ADB_CALL_LOG="$TEST_DIR/calls-$tag.log" \
+    MOCK_SLEEP_LOG="$TEST_DIR/sleeps-$tag.log" \
     HOME="$TEST_DIR/home" \
     PATH="$TEST_DIR/bin:$BASE_PATH" \
     "${NO_TTY[@]}" timeout 10s bash "$ROOT_DIR/$script.sh" "$@" </dev/null 2>&1
@@ -221,6 +276,12 @@ run_script() {
 # /dev/tty and reads the piped text. Every value goes through printf %q because
 # the device list is multi-line.
 #
+# The same eight knobs run_script pins are pinned here, and the environment is
+# scrubbed at startup, so a knob's value can only be the one this case set with
+# its prefix. Naming all of them matters independently of that: a knob missing
+# from the list is simply not passed, so the child sees whatever the environment
+# happened to hold.
+#
 # The command is passed to `script` unwrapped on purpose. A `bash -c '…'`
 # wrapper (tried here to shave script's teardown) puts the managed command in a
 # different process group, and start.sh's `read … </dev/tty` then takes SIGTTIN
@@ -228,11 +289,14 @@ run_script() {
 # a pty case costs about half a second.
 pty_start() {
   local tag=$1 devices=$2 answer=$3 cmd
-  printf -v cmd 'env PATH=%q HOME=%q MOCK_ADB_DEVICES=%q MOCK_ADB_SHELL_ADDR=%q MOCK_ADB_PAIR=%q MOCK_ADB_CONNECT=%q MOCK_ADB_CALL_LOG=%q timeout 10s bash %q' \
-    "$TEST_DIR/bin:$BASE_PATH" "$TEST_DIR/home" "$devices" "$IP_ADDR_FIXTURE" \
+  printf -v cmd 'env PATH=%q HOME=%q MOCK_ADB_DEVICES=%q MOCK_ADB_SHELL_ADDR=%q MOCK_ADB_PAIR=%q MOCK_ADB_CONNECT=%q MOCK_ADB_KILL_SERVER=%q MOCK_ADB_DISCONNECT_FAIL=%q MOCK_PING=%q MOCK_PING_FAIL=%q MOCK_ADB_CALL_LOG=%q MOCK_SLEEP_LOG=%q timeout 10s bash %q' \
+    "$TEST_DIR/bin:$BASE_PATH" "$TEST_DIR/home" "$devices" \
+    "${MOCK_ADB_SHELL_ADDR:-$IP_ADDR_FIXTURE}" \
     "${MOCK_ADB_PAIR:-ok}" "${MOCK_ADB_CONNECT:-ok}" \
-    "$TEST_DIR/calls-$tag.log" "$ROOT_DIR/start.sh"
-  rm -f "$TEST_DIR/calls-$tag.log"
+    "${MOCK_ADB_KILL_SERVER:-ok}" "${MOCK_ADB_DISCONNECT_FAIL:-}" \
+    "${MOCK_PING:-ok}" "${MOCK_PING_FAIL:-}" \
+    "$TEST_DIR/calls-$tag.log" "$TEST_DIR/sleeps-$tag.log" "$ROOT_DIR/start.sh"
+  rm -f "$TEST_DIR/calls-$tag.log" "$TEST_DIR/sleeps-$tag.log"
   printf '%s' "$answer" | script -qec "$cmd" /dev/null 2>&1
 }
 
@@ -248,41 +312,19 @@ calls() {
   cat "$TEST_DIR/calls-$1.log" 2>/dev/null || true
 }
 
-wait_for_pid_gone() {
-  local pid=${1:-} i
-  [[ -n "$pid" ]] || return 0
-  for i in $(seq 1 50); do
-    kill -0 "$pid" 2>/dev/null || return 0
-    sleep 0.1
-  done
-  return 1
+# Every sleep the stub was asked for, one duration per line. Empty means the
+# stub never ran, i.e. something real shadowed it.
+sleeps() {
+  cat "$TEST_DIR/sleeps-$1.log" 2>/dev/null || true
 }
 
-# Stop a process a case started, unconditionally, and reap it. Safe to call with
-# an empty or already-dead pid. Escalates to SIGKILL so a mock that ignores
-# SIGTERM cannot outlive the suite.
-stop_pid() {
-  local pid=${1:-}
-  [[ -n "$pid" ]] || return 0
-  kill "$pid" 2>/dev/null || true
-  if wait_for_pid_gone "$pid"; then
-    return 0
-  fi
-  kill -9 "$pid" 2>/dev/null || true
-  wait_for_pid_gone "$pid" || true
-  return 0
-}
-
-# Reap anything a case recorded, then drop the temp tree. Registered as the EXIT
-# trap, so a failing assertion still cleans up instead of orphaning a process.
+# Drop the temp tree. Registered as the EXIT trap so a failing assertion still
+# cleans up. There is no pid sweep to do: every child in this suite is a
+# foreground `timeout` in a command substitution, which reaps its own child
+# before the harness ever sees its status, so a case that fails its assertions
+# has nothing left running either way. A sweep over a glob nothing writes
+# would only look like a guarantee.
 cleanup() {
-  local f pid
-  for f in "$TEST_DIR"/hold-*.pid; do
-    [[ -s "$f" ]] || continue
-    pid=$(cat "$f" 2>/dev/null) || pid=""
-    stop_pid "$pid"
-    rm -f "$f"
-  done
   rm -rf "$TEST_DIR"
   return 0
 }
@@ -447,10 +489,8 @@ fi
 
 # The mock ping answers immediately, so the Wi-Fi address from the ip addr
 # fixture must be selected on the first candidate.
-started=$SECONDS
 output=$(run_script start usb "$USB_DEVICES")
 status=$?
-elapsed=$(( SECONDS - started ))
 [[ $status -eq 0 ]] || fail "the USB happy path exited $status; expected 0" "$output"
 [[ "$output" == *"USB device detected: 422ae881"* ]] || fail "the USB device was not detected" "$output"
 [[ "$output" == *"Target IP address: 192.168.139.208"* ]] ||
@@ -464,11 +504,11 @@ elapsed=$(( SECONDS - started ))
 # present in the fixture.
 [[ "$output" != *"Target IP address: 127.0.0.1"* && "$output" != *"Target IP address: 10.132.19.5"* ]] ||
   fail "an unreachable interface was chosen" "$output"
-# The sleep stub must be in force. The bound is deliberately loose — one second
-# of slack for a loaded machine — but start.sh's own sleep 2 after tcpip and
-# sleep 3 between connect attempts add up to five, so a case that stopped
-# shadowing sleep cannot pass this.
-[[ $elapsed -le 2 ]] || fail "the happy path took ${elapsed}s; the sleep stub is not in force" "$output"
+# The stub sleep, not a real one, is what ran: it was asked for the 2s settle
+# after tcpip and got it. A wall-clock bound cannot establish this — the happy
+# path only ever spends the 2s, which is inside the noise of a loaded machine.
+[[ "$(sleeps usb)" == "2" ]] ||
+  fail "the tcpip settle did not go through the stub sleep" "$(sleeps usb)"
 
 # ICMP can be blocked, so a Wi-Fi address that does not answer must still be
 # tried, with a warning, rather than dropping the user at a manual-IP prompt.
@@ -478,6 +518,51 @@ status=$?
 [[ "$output" == *"Could not ping 192.168.139.208, but it is on a Wi-Fi interface; trying it anyway."* ]] ||
   fail "the unreachable-Wi-Fi fallback did not warn" "$output"
 [[ "$output" == *"Done! Enjoy wireless ADB."* ]] || fail "the fallback did not connect" "$output"
+
+# --- start.sh: IP selection ---------------------------------------------------
+
+# Two pingable addresses on one Wi-Fi interface: the first candidate wins. Both
+# are already in the device dump, so a run that picked the second would still
+# exit 0 — the assertion on the chosen address is the only thing that
+# discriminates, which is what makes it worth having.
+output=$(MOCK_ADB_SHELL_ADDR="$IP_ADDR_TWO_WIFI" run_script start pingfirst "$BOTH_WIFI_DEVICES")
+status=$?
+[[ $status -eq 0 ]] || fail "two pingable candidates returned $status; expected 0" "$output"
+[[ "$output" == *"Target IP address: 192.168.139.208"* ]] ||
+  fail "the first pingable candidate was not chosen" "$output"
+[[ "$(calls pingfirst)" == *"connect 192.168.139.208:5555"* ]] ||
+  fail "the first candidate is not the one connected to" "$(calls pingfirst)"
+
+# The first candidate does not answer, the second does: the selection is the
+# first REACHABLE candidate, not simply the first one. This is the case that
+# pins the ping loop itself — with the loop deleted, step_get_ip falls back to
+# the first Wi-Fi address regardless of reachability, which is 192.168.139.208,
+# and the assertion below fails.
+output=$(MOCK_PING_FAIL=192.168.139.208 \
+  MOCK_ADB_SHELL_ADDR="$IP_ADDR_TWO_WIFI" run_script start pingsecond "$BOTH_WIFI_DEVICES")
+status=$?
+[[ $status -eq 0 ]] || fail "one unreachable candidate returned $status; expected 0" "$output"
+[[ "$output" == *"Target IP address: 192.168.139.209"* ]] ||
+  fail "the unreachable first candidate was chosen over the reachable second one" "$output"
+[[ "$output" != *"Could not ping"* ]] ||
+  fail "a reachable second candidate still produced the fallback warning" "$output"
+[[ "$(calls pingsecond)" == *"connect 192.168.139.209:5555"* ]] ||
+  fail "the reachable second candidate is not the one connected to" "$(calls pingsecond)"
+
+# An unknown interface on a private range is not a reachable LAN address. With
+# no Wi-Fi candidate to fall back on, the run must end at the manual-IP prompt
+# with no address — a candidate that survived the filter here would be chosen
+# and the run would succeed.
+output=$(MOCK_ADB_SHELL_ADDR="$IP_ADDR_PRIVATE_UNKNOWN" \
+  run_script start privateunknown "$USB_DEVICES")
+status=$?
+[[ $status -eq 1 ]] || fail "a private address on an unknown interface exited $status; expected 1" "$output"
+[[ "$output" != *"Target IP address: 10.8.0.5"* ]] ||
+  fail "a private address on an unknown interface was treated as reachable" "$output"
+[[ "$output" == *"No IP provided. Exiting."* ]] ||
+  fail "no reachable address did not end at the manual-IP prompt" "$output"
+[[ "$(call_count privateunknown tcpip)" -eq 0 ]] ||
+  fail "an unreachable address still reached 'adb tcpip'" "$(calls privateunknown)"
 
 # The post-tcpip verification matches the target literally. The dump below holds
 # only a lookalike serial, one non-digit character for each '.' in
@@ -517,6 +602,10 @@ status=$?
   fail "a failed connect still reported success" "$output"
 [[ "$(call_count connectfail connect)" -eq 2 ]] ||
   fail "connect was attempted $(call_count connectfail connect) times; expected 2" "$(calls connectfail)"
+# Both waits the retry path takes — the 2s settle and the 3s between attempts —
+# went through the stub, so the retry is real and cost nothing.
+[[ "$(sleeps connectfail)" == $'2\n3' ]] ||
+  fail "the connect retry did not sleep 2 then 3 through the stub" "$(sleeps connectfail)"
 
 # A pairing path that cannot connect fails the same way, and must not report
 # success either.
@@ -552,26 +641,46 @@ else
   echo "SKIP: pairing failure case needs util-linux 'script' for a pty"
 fi
 
-# --- start.sh: adb missing ----------------------------------------------------
+# --- start.sh / stop.sh: adb missing ------------------------------------------
 
 # A PATH with no adb on it. Only the tools a script can reach before check_adb
 # exits are linked in, rather than a mirror of /usr/bin: a full mirror costs
 # about ten seconds of symlinks, and check_adb is the first thing either script
 # does after the banner.
-mkdir -p "$TEST_DIR/no-adb-bin"
-for tool in bash env timeout awk grep sed cat head tail tr cut sort uname id whoami sleep setsid; do
+#
+# bash and timeout are the two this cannot do without — one runs the script, the
+# other bounds it. setsid is not required: without it the runner simply passes no
+# argument, which the "NOTE: setsid not found" path already covers. Anything
+# missing is reported by name and the cases are skipped, because the failure
+# mode otherwise is a bare status 127 that looks like a broken assertion.
+NO_ADB_TOOLS=(bash env timeout awk grep sed cat head tail tr cut sort uname id whoami sleep setsid)
+NO_ADB_REQUIRED=(bash timeout)
+NO_ADB_BIN="$TEST_DIR/no-adb-bin"
+mkdir -p "$NO_ADB_BIN"
+for tool in "${NO_ADB_TOOLS[@]}"; do
   tool_path=$(command -v "$tool" 2>/dev/null) || continue
-  ln -sf "$tool_path" "$TEST_DIR/no-adb-bin/$tool" 2>/dev/null || true
+  ln -sf "$tool_path" "$NO_ADB_BIN/$tool" 2>/dev/null || true
+done
+NO_ADB_OK=true
+for tool in "${NO_ADB_REQUIRED[@]}"; do
+  if [[ ! -x "$NO_ADB_BIN/$tool" ]]; then
+    NO_ADB_OK=false
+    echo "SKIP: no-adb cases need '$tool' on this system to build a PATH without adb" >&2
+  fi
 done
 
-out=$(env -i HOME="$TEST_DIR/home" PATH="$TEST_DIR/no-adb-bin" \
-  "${NO_TTY[@]}" timeout 10s bash "$ROOT_DIR/start.sh" </dev/null 2>&1)
-status=$?
-[[ $status -eq 1 ]] || fail "start.sh without adb exited $status; expected 1" "$out"
-[[ "$out" == *"adb not found on this system."* ]] || fail "start.sh did not report the missing adb" "$out"
-# Install hints must use pkexec, never sudo.
-[[ "$out" == *"pkexec apt install adb"* ]] || fail "start.sh has no pkexec install hint" "$out"
-[[ "$out" != *"sudo"* ]] || fail "start.sh suggests sudo" "$out"
+if [[ $NO_ADB_OK == true ]]; then
+  out=$(env -i HOME="$TEST_DIR/home" PATH="$NO_ADB_BIN" \
+    "${NO_TTY[@]}" timeout 10s bash "$ROOT_DIR/start.sh" </dev/null 2>&1)
+  status=$?
+  [[ $status -eq 1 ]] || fail "start.sh without adb exited $status; expected 1" "$out"
+  [[ "$out" == *"adb not found on this system."* ]] || fail "start.sh did not report the missing adb" "$out"
+  # Install hints must use pkexec, never sudo.
+  [[ "$out" == *"pkexec apt install adb"* ]] || fail "start.sh has no pkexec install hint" "$out"
+  [[ "$out" != *"sudo"* ]] || fail "start.sh suggests sudo" "$out"
+else
+  echo "SKIP: start.sh missing-adb case (no bash/timeout to build a PATH without adb)"
+fi
 
 # --- stop.sh -----------------------------------------------------------------
 
@@ -612,8 +721,13 @@ status=$?
   fail "the offline target was not disconnected" "$(calls all)"
 [[ "$(calls all)" == *"disconnect 192.168.1.51:5555"* ]] ||
   fail "the no-permissions target was not disconnected" "$(calls all)"
-[[ "$output" != *"disconnect 422ae881"* ]] ||
+# The call log, not the output: stop.sh prints "[*] Disconnecting <serial>…"
+# with a capital D, so grepping the output for a lowercase "disconnect <serial>"
+# would never match and the assertion would pass whatever adb was asked to do.
+[[ "$(call_count all "disconnect 422ae881")" -eq 0 ]] ||
   fail "a USB target was sent to adb disconnect" "$(calls all)"
+[[ "$(call_count all disconnect)" -eq 2 ]] ||
+  fail "stop.sh -a made $(call_count all disconnect) disconnect calls; expected 2" "$(calls all)"
 [[ "$(call_count all kill-server)" -eq 0 ]] || fail "stop.sh -a killed the server" "$(calls all)"
 
 # Each target is labelled with its real state, and the whole remainder of the
@@ -632,13 +746,16 @@ status=$?
 [[ "$(call_count labels devices)" -eq 1 ]] ||
   fail "stop.sh called 'adb devices' $(call_count labels devices) times; expected 1" "$(calls labels)"
 
-# The default action at the menu is "3) Cancel", which must touch nothing.
+# The default action at the menu is "3) Cancel", which must touch nothing. The
+# call log is the only place that can prove "nothing": the menu prompt and the
+# Cancelled line are printed either way, so an output-only check passes even if
+# the targets were disconnected just before the prompt.
 output=$(run_script stop cancel "List of devices attached
 192.168.1.50:5555    device")
 status=$?
 [[ $status -eq 0 ]] || fail "the cancel path exited $status; expected 0" "$output"
 [[ "$output" == *"Cancelled."* ]] || fail "the cancel path did not report cancelling" "$output"
-[[ "$output" != *"disconnect 192.168.1.50:5555"* ]] ||
+[[ "$(call_count cancel disconnect)" -eq 0 ]] ||
   fail "the cancel path still disconnected a target" "$(calls cancel)"
 [[ "$(call_count cancel kill-server)" -eq 0 ]] || fail "the cancel path still killed the server" "$(calls cancel)"
 [[ "$(call_count cancel start-server)" -eq 0 ]] || fail "the cancel path still restarted the server" "$(calls cancel)"
@@ -680,27 +797,32 @@ status=$?
 [[ "$output" == *"adb kill-server && adb start-server"* ]] ||
   fail "the partial failure gives no next step" "$output"
 
-# stop.sh's adb hint is the one Task 1 added hints to, so it needs coverage.
-out=$(env -i HOME="$TEST_DIR/home" PATH="$TEST_DIR/no-adb-bin" \
-  "${NO_TTY[@]}" timeout 10s bash "$ROOT_DIR/stop.sh" -a </dev/null 2>&1)
-status=$?
-[[ $status -eq 1 ]] || fail "stop.sh without adb exited $status; expected 1" "$out"
-[[ "$out" == *"adb not found on this system."* ]] || fail "stop.sh did not report the missing adb" "$out"
-[[ "$out" == *"pkexec pacman -S android-tools"* ]] || fail "stop.sh has no pkexec install hint" "$out"
-[[ "$out" != *"sudo"* ]] || fail "stop.sh suggests sudo" "$out"
+if [[ $NO_ADB_OK == true ]]; then
+  # stop.sh's adb hint is the one Task 1 added hints to, so it needs coverage.
+  out=$(env -i HOME="$TEST_DIR/home" PATH="$NO_ADB_BIN" \
+    "${NO_TTY[@]}" timeout 10s bash "$ROOT_DIR/stop.sh" -a </dev/null 2>&1)
+  status=$?
+  [[ $status -eq 1 ]] || fail "stop.sh without adb exited $status; expected 1" "$out"
+  [[ "$out" == *"adb not found on this system."* ]] || fail "stop.sh did not report the missing adb" "$out"
+  [[ "$out" == *"pkexec pacman -S android-tools"* ]] || fail "stop.sh has no pkexec install hint" "$out"
+  [[ "$out" != *"sudo"* ]] || fail "stop.sh suggests sudo" "$out"
 
-# adb is validated in one place, so -k is validated too. It used to run
-# check_adb from inside the argument-parsing loop, which is how -k came to
-# validate adb at a different point from every other path.
-out=$(env -i HOME="$TEST_DIR/home" PATH="$TEST_DIR/no-adb-bin" \
-  "${NO_TTY[@]}" timeout 10s bash "$ROOT_DIR/stop.sh" -k </dev/null 2>&1)
-status=$?
-[[ $status -eq 1 ]] || fail "stop.sh -k without adb exited $status; expected 1" "$out"
-[[ "$out" == *"adb not found on this system."* ]] ||
-  fail "stop.sh -k did not validate adb" "$out"
-[[ "$out" != *"Killing ADB server..."* ]] || fail "stop.sh -k tried to kill a server with no adb" "$out"
+  # adb is validated in one place, so -k is validated too. It used to run
+  # check_adb from inside the argument-parsing loop, which is how -k came to
+  # validate adb at a different point from every other path.
+  out=$(env -i HOME="$TEST_DIR/home" PATH="$NO_ADB_BIN" \
+    "${NO_TTY[@]}" timeout 10s bash "$ROOT_DIR/stop.sh" -k </dev/null 2>&1)
+  status=$?
+  [[ $status -eq 1 ]] || fail "stop.sh -k without adb exited $status; expected 1" "$out"
+  [[ "$out" == *"adb not found on this system."* ]] ||
+    fail "stop.sh -k did not validate adb" "$out"
+  [[ "$out" != *"Killing ADB server..."* ]] || fail "stop.sh -k tried to kill a server with no adb" "$out"
+else
+  echo "SKIP: stop.sh missing-adb cases (no bash/timeout to build a PATH without adb)"
+fi
 
 echo "PASS: start.sh validates --port at both input paths, rejects unknown flags, and drives the Android 11+ pairing flow"
 echo "PASS: start.sh falls back to the first device on bad picker input, completes the USB happy path, and reports a failed connect"
+echo "PASS: start.sh picks the first reachable Wi-Fi address and rejects a private one on an unknown interface"
 echo "PASS: stop.sh rejects unknown flags, labels each target with its real state, and lists devices exactly once"
 echo "PASS: stop.sh -a disconnects every target, -k kills the server, a partial disconnect is not reported as success, and cancel touches nothing"
