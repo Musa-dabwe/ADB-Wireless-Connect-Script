@@ -7,6 +7,7 @@ CYAN='\033[0;36m'
 NC='\033[0m'
 
 DISCONNECT_ALL=false
+KILL_SERVER=false
 
 check_adb() {
   if ! command -v adb &>/dev/null; then
@@ -37,13 +38,7 @@ show_help() {
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     -a|--all) DISCONNECT_ALL=true; shift ;;
-    -k|--kill)
-      check_adb
-      echo -e "${YELLOW}[*] Killing ADB server...${NC}"
-      adb kill-server
-      echo -e "${GREEN}[✓] ADB server killed.${NC}"
-      exit 0
-      ;;
+    -k|--kill) KILL_SERVER=true; shift ;;
     -h|--help) show_help; exit 0 ;;
     *) echo -e "${YELLOW}[!] Unknown option: $1${NC}"; show_help; exit 1 ;;
   esac
@@ -58,17 +53,42 @@ print_banner() {
   echo -e "${NC}"
 }
 
+# Read one serial's state out of a cached "adb devices" dump. A serial that is
+# not in the dump is still a wireless target (the filter matches on the serial
+# alone), so it is reported as "unknown" rather than presented as active.
+_device_state() {
+  local serial=$1 dump=$2 state
+  state=$(printf '%s\n' "$dump" | awk -v s="$serial" 'NR>1 && $1 == s { print $2; exit }')
+  printf '%s\n' "${state:-unknown}"
+}
+
 main() {
   print_banner
   check_adb
 
+  if $KILL_SERVER; then
+    echo -e "${YELLOW}[*] Killing ADB server...${NC}"
+    if ! adb kill-server; then
+      echo -e "${YELLOW}[!] adb kill-server failed. Try 'adb kill-server' manually.${NC}"
+      return 1
+    fi
+    echo -e "${GREEN}[✓] ADB server killed.${NC}"
+    return 0
+  fi
+
+  local dev
+  # One adb call: the wireless list and the per-entry state labels are both
+  # derived from this snapshot, so the listing can never contradict itself.
+  local devices_out
+  devices_out=$(adb devices || true)
+
   local wireless_devices
-  mapfile -t wireless_devices < <(adb devices | awk 'NR>1 && $1 ~ /:[0-9]+$/ {print $1}')
+  mapfile -t wireless_devices < <(printf '%s\n' "$devices_out" | awk 'NR>1 && $1 ~ /:[0-9]+$/ {print $1}')
 
   if [[ ${#wireless_devices[@]} -eq 0 ]]; then
     echo -e "${YELLOW}[!] No active wireless ADB connections found.${NC}"
     echo ""
-    adb devices
+    printf '%s\n' "$devices_out"
     echo ""
     echo "Select an action:"
     echo "  1) Restart ADB server completely"
@@ -89,9 +109,9 @@ main() {
     exit 0
   fi
 
-  echo -e "${YELLOW}[*] Active wireless ADB connections:${NC}"
+  echo -e "${YELLOW}[*] Wireless ADB targets:${NC}"
   for dev in "${wireless_devices[@]}"; do
-    echo "    • $dev"
+    echo "    • $dev ($(_device_state "$dev" "$devices_out"))"
   done
   echo ""
 
