@@ -6,6 +6,28 @@ YELLOW='\033[1;33m'
 CYAN='\033[0;36m'
 NC='\033[0m'
 
+# Bash arithmetic reads a leading zero as an octal digit, so a device-picker
+# answer of 08 aborts with "value too great for base", and sleep is handed a
+# padded value. Strip the zero padding in one place for every user-supplied
+# number: a whole number for the picker, optionally fractional for --timeout.
+# A value with no numeric form is passed through untouched so the caller's own
+# validation stays in charge. Defined above the flag parser because --timeout
+# normalizes its value while parsing.
+_normalize_number() {
+  local value=$1 int
+  [[ "$value" =~ ^[0-9]+(\.[0-9]+)?$ ]] || { printf '%s\n' "$value"; return 0; }
+  int="${value%%.*}"
+  # Keep at least one digit so 0.5 normalizes to 0.5 and not to .5.
+  while [[ ${#int} -gt 1 && "${int:0:1}" == "0" ]]; do
+    int="${int:1}"
+  done
+  if [[ "$value" == *.* ]]; then
+    printf '%s.%s\n' "$int" "${value#*.}"
+  else
+    printf '%s\n' "$int"
+  fi
+}
+
 SCRCPY_ARGS=()
 
 show_help() {
@@ -19,12 +41,24 @@ show_help() {
   echo "Options:"
   echo "  -a, --args ...      Pass custom arguments to scrcpy (must be final option)"
   echo "  -s, --serial S      Specify device serial (USB id or ip:port)"
+  echo "  -t, --timeout S     Startup grace period in seconds (default: 2)"
+  echo "  -w, --wait          Run in the foreground and exit with scrcpy's status"
+  echo "  -f, --force         Kill a scrcpy session already running, then start a new one"
   echo "  -h, --help          Show this help message"
+  echo ""
+  echo "Session notes:"
+  echo "  Without --wait the launcher backgrounds scrcpy, waits $SCRCPY_TIMEOUT seconds to"
+  echo "  confirm it survived startup, prints the log and PID file paths, and exits 0."
+  echo "  With --wait it blocks until scrcpy exits and exits with scrcpy's own status,"
+  echo "  so a mid-session crash is visible in your terminal."
   echo ""
 }
 
 # Parse CLI flags
 DEVICE_SERIAL=""
+SCRCPY_TIMEOUT=2
+SCRCPY_WAIT=0
+SCRCPY_FORCE=0
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     -a|--args)
@@ -64,6 +98,33 @@ while [[ "$#" -gt 0 ]]; do
       DEVICE_SERIAL="$2"
       shift 2
       ;;
+    -t|--timeout)
+      if [[ -z "${2:-}" ]]; then
+        echo -e "${YELLOW}[!] Option $1 requires a grace period in seconds, e.g. --timeout 2.${NC}"
+        show_help
+        exit 1
+      fi
+      # The format check also catches negatives and leading '-' values such as
+      # "--timeout -s foo", so the message names the offending value.
+      if ! [[ "$2" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then
+        echo -e "${YELLOW}[!] --timeout must be a positive number of seconds, got: $2${NC}"
+        echo "  Use a plain value such as 2 or 0.5; the default is 2."
+        show_help
+        exit 1
+      fi
+      # A value like 0 or 0.00 passes the format check but means "no grace
+      # period at all", which would race a healthy slow start; reject it.
+      if ! [[ "$2" =~ [1-9] ]]; then
+        echo -e "${YELLOW}[!] --timeout must be greater than zero, got: $2${NC}"
+        echo "  Use a positive value such as 2 or 0.5; the default is 2."
+        show_help
+        exit 1
+      fi
+      SCRCPY_TIMEOUT=$(_normalize_number "$2")
+      shift 2
+      ;;
+    -w|--wait) SCRCPY_WAIT=1; shift ;;
+    -f|--force) SCRCPY_FORCE=1; shift ;;
     -h|--help) show_help; exit 0 ;;
     *) echo -e "${YELLOW}[!] Unknown option: $1${NC}"; show_help; exit 1 ;;
   esac
@@ -210,6 +271,9 @@ detect_device() {
       echo "    $((i+1))) ${rows[$i]#* }  [${rows[$i]%% *}]"
     done
     read -rp "  Select device number [1-${#rows[@]}, default: 1]: " choice </dev/tty || choice=1
+    # Strip zero padding first: bash arithmetic would read 08 as an invalid
+    # octal number and, under set -e, abort the script with no message.
+    choice=$(_normalize_number "$choice")
     [[ "$choice" =~ ^[0-9]+$ ]] || choice=1
     local idx=$((choice-1))
     [[ $idx -ge 0 && $idx -lt ${#rows[@]} ]] || idx=0
@@ -265,21 +329,140 @@ show_shortcuts() {
   echo ""
 }
 
+_state_dir() {
+  printf '%s\n' "${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/adb-wireless-connect"
+}
+
+# Refuse to start a second scrcpy against the same setup while one is already
+# running. A PID file whose process is gone is stale and never blocks a launch.
+_check_existing_session() {
+  local pid_file=$1 recorded
+  [[ -s "$pid_file" ]] || return 0
+  read -r recorded <"$pid_file" || recorded=""
+  # A PID file that does not hold a plain number cannot be probed; treat it as
+  # stale and let the launch overwrite it.
+  if [[ ! "$recorded" =~ ^[0-9]+$ ]]; then
+    return 0
+  fi
+
+  if kill -0 "$recorded" 2>/dev/null; then
+    if [[ $SCRCPY_FORCE -eq 1 ]]; then
+      echo -e "${YELLOW}[!] --force given: stopping the scrcpy session already running (PID: $recorded).${NC}"
+      kill "$recorded" 2>/dev/null || true
+      _wait_for_exit "$recorded" || {
+        echo -e "${YELLOW}[!] Could not stop the scrcpy session (PID: $recorded).${NC}"
+        echo "  Run 'kill -9 $recorded' by hand, then re-run this script."
+        return 1
+      }
+      return 0
+    fi
+    echo -e "${YELLOW}[!] A scrcpy session is already running (PID: $recorded).${NC}"
+    echo ""
+    echo "  Stop it first:  kill $recorded"
+    echo "  Or re-run with --force to stop it and start a new one."
+    echo -e "${CYAN}  PID file: $pid_file${NC}"
+    return 1
+  fi
+
+  # Stale PID file: the process is gone, so overwrite it silently below.
+  return 0
+}
+
+# Give a signalled process a moment to go away, then insist.
+_wait_for_exit() {
+  local pid=$1 i
+  for i in 1 2 3 4 5 6 7 8 9 10; do
+    kill -0 "$pid" 2>/dev/null || return 0
+    sleep 0.1
+  done
+  if kill -0 "$pid" 2>/dev/null; then
+    kill -9 "$pid" 2>/dev/null || true
+    sleep 0.1
+  fi
+  ! kill -0 "$pid" 2>/dev/null
+}
+
+# Keep the log directory bounded: retain the newest $1 scrcpy.*.log files, plus
+# the current launch's log even if it is not among the newest.
+_prune_logs() {
+  local keep=$1 current=$2 dir=$3
+  local -a logs=()
+  local log
+  while IFS= read -r log; do
+    [[ -n "$log" ]] || continue
+    [[ "$log" == "$current" ]] && continue
+    logs+=("$log")
+  done < <(ls -1t "$dir"/scrcpy.*.log 2>/dev/null)
+  [[ ${#logs[@]} -le $keep ]] && return 0
+  for log in "${logs[@]:$keep}"; do
+    rm -f "$log" 2>/dev/null || true
+  done
+  return 0
+}
+
+# Foreground mode: block until scrcpy exits, then hand its status back.
+_launch_and_wait() {
+  local log_file=$1 pid_file=$2
+  local scrcpy_pid exit_status
+
+  scrcpy -s "$DEVICE_SERIAL" "${SCRCPY_ARGS[@]}" >"$log_file" 2>&1 &
+  scrcpy_pid=$!
+  printf '%s\n' "$scrcpy_pid" >"$pid_file"
+
+  set +e
+  wait "$scrcpy_pid"
+  exit_status=$?
+  set -e
+  rm -f "$pid_file"
+
+  if [[ $exit_status -ne 0 ]]; then
+    echo -e "${YELLOW}[!] scrcpy exited with status: $exit_status${NC}"
+    if [[ -s "$log_file" ]]; then
+      sed 's/^/    /' "$log_file"
+    fi
+    echo -e "${CYAN}    Log: $log_file${NC}"
+  else
+    echo -e "${GREEN}[✓] scrcpy exited cleanly.${NC}"
+    echo -e "${CYAN}    Log: $log_file${NC}"
+  fi
+  return "$exit_status"
+}
+
 launch_scrcpy() {
   echo -e "${YELLOW}[*] Launching scrcpy...${NC}"
   if [[ ${#SCRCPY_ARGS[@]} -gt 0 ]]; then
     echo -e "${CYAN}    Args: ${SCRCPY_ARGS[*]}${NC}"
   fi
 
-  local log_dir log_file scrcpy_pid exit_status
-  log_dir="${XDG_STATE_HOME:-${HOME:-/tmp}/.local/state}/adb-wireless-connect"
+  local log_dir log_file pid_file scrcpy_pid exit_status
+  log_dir=$(_state_dir)
   mkdir -p "$log_dir"
+  pid_file="$log_dir/scrcpy.pid"
+
+  if ! _check_existing_session "$pid_file"; then
+    return 1
+  fi
+
   log_file=$(mktemp "$log_dir/scrcpy.XXXXXX.log")
+
+  if [[ $SCRCPY_WAIT -eq 1 ]]; then
+    echo -e "${CYAN}    Running in the foreground; press Ctrl+C or close the scrcpy window to stop.${NC}"
+    echo -e "${CYAN}    Log: $log_file${NC}"
+    echo -e "${CYAN}    PID file: $pid_file${NC}"
+    # Prune before blocking: a foreground session can run for hours, and this
+    # launch's own log is already the newest, so nothing useful is lost.
+    _prune_logs 10 "$log_file" "$log_dir"
+    # Propagate scrcpy's status explicitly rather than relying on the caller
+    # having suspended errexit around this function.
+    _launch_and_wait "$log_file" "$pid_file" || return $?
+    return 0
+  fi
 
   nohup scrcpy -s "$DEVICE_SERIAL" "${SCRCPY_ARGS[@]}" >"$log_file" 2>&1 &
   scrcpy_pid=$!
+  printf '%s\n' "$scrcpy_pid" >"$pid_file"
 
-  sleep 1.25
+  sleep "$SCRCPY_TIMEOUT"
   if ! kill -0 "$scrcpy_pid" 2>/dev/null; then
     set +e
     wait "$scrcpy_pid"
@@ -292,11 +475,15 @@ launch_scrcpy() {
       sed 's/^/    /' "$log_file"
     fi
     echo -e "${CYAN}    Log: $log_file${NC}"
+    rm -f "$pid_file"
     return "$exit_status"
   fi
 
   echo -e "${GREEN}[✓] scrcpy started and passed the startup check (PID: $scrcpy_pid)${NC}"
   echo -e "${CYAN}    Log: $log_file${NC}"
+  echo -e "${CYAN}    PID file: $pid_file${NC}"
+  echo "    Stop it with:  kill $scrcpy_pid"
+  _prune_logs 10 "$log_file" "$log_dir"
 }
 
 main() {
@@ -311,10 +498,16 @@ main() {
   fi
 
   show_shortcuts
-  launch_scrcpy
+  # Propagate scrcpy's own status: the existing suite asserts 42/43 for a failed
+  # startup, and --wait reports the status of a session that ran and then died.
+  local status=0
+  launch_scrcpy || status=$?
 
-  echo ""
-  echo -e "${GREEN}  Launcher finished. Check the scrcpy window or log for runtime status.${NC}"
+  if [[ $status -eq 0 ]]; then
+    echo ""
+    echo -e "${GREEN}  Launcher finished. Check the scrcpy window or log for runtime status.${NC}"
+  fi
+  return "$status"
 }
 
 main
