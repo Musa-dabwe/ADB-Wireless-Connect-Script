@@ -58,6 +58,16 @@ case "${MOCK_SCRCPY_MODE:-}" in
     trap ':' TERM INT
     while :; do sleep 1; done
     ;;
+  shape_shift)
+    echo "mock scrcpy running"
+    echo "$$" >"${MOCK_SCRCPY_PID_FILE}"
+    # Ignores SIGTERM, but becomes a different program while keeping the same
+    # PID. That is what a recycled PID looks like from the launcher's side, and
+    # it is the only way to exercise the identity recheck the SIGKILL escalation
+    # makes: the process outlives the grace period and is no longer scrcpy.
+    trap 'exec sleep 300' TERM INT
+    while :; do sleep 0.2; done
+    ;;
   *)
     echo "unknown mock scrcpy mode" >&2
     exit 64
@@ -406,6 +416,28 @@ for option in "-t, --timeout" "-w, --wait" "-f, --force"; do
   [[ "$help_out" == *"$option"* ]] || fail "$option is not documented in --help" "$help_out"
 done
 
+# The help names the grace period twice: once as the default in the option list
+# and once as the value this run will use. Both must come from the same source,
+# because --timeout is parsed before -h can print anything. When the two were
+# independent, `--timeout 5 --help` printed "default: 2" and "waits 5 seconds" in
+# one help text with nothing to say they were different quantities.
+help_after=$(HOME="$TEST_DIR/home" PATH="$TEST_DIR/bin:$PATH" \
+  bash "$ROOT_DIR/scrcpy.sh" --timeout 5 --help 2>&1)
+help_after_status=$?
+[[ $help_after_status -eq 0 ]] || fail "--help after --timeout exited $help_after_status; expected 0" "$help_after"
+[[ "$help_after" == *"(default: 2)"* ]] ||
+  fail "--help after --timeout 5 does not report the real default" "$help_after"
+[[ "$help_after" == *"waits 5 seconds"* ]] ||
+  fail "--help after --timeout 5 does not report the effective grace period" "$help_after"
+# Without this the two lines above are back to reading as a contradiction.
+[[ "$help_after" == *"defaults to 2 seconds"* ]] ||
+  fail "--help does not distinguish the default from the effective grace period" "$help_after"
+# The reverse error: reporting the effective value as if it were the default.
+[[ "$help_after" != *"default: 5"* ]] ||
+  fail "--help reported the effective --timeout as the default" "$help_after"
+[[ "$help_after" != *"defaults to 5 seconds"* ]] ||
+  fail "--help reported the effective --timeout as the default" "$help_after"
+
 # --timeout rejects anything that is not a positive number of seconds. The
 # format check is what rejects a negative, so no separate case is needed.
 for bad_timeout in abc -1 1e3 2s; do
@@ -437,18 +469,18 @@ status=$?
 [[ "$output" == *"requires a grace period in seconds"* ]] || fail "trailing --timeout message is missing" "$output"
 [[ "$output" != *"unbound variable"* ]] || fail "trailing --timeout died on an unbound variable" "$output"
 
-# A short grace period is accepted and really is shorter. The delayed mock lives
+# A short grace period is accepted and really is short. The delayed mock lives
 # 0.75s and exits 43, which the 2s default above already saw die; at 0.2s it is
-# still alive, so this launch succeeds and returns well before the default would.
-start=$SECONDS
+# still alive, so this launch succeeds. No wall-clock bound is asserted: the old
+# `elapsed <= 1` was measured in whole $SECONDS against a 0.55s margin, so it
+# failed on a loaded machine and could not be made meaningful by loosening it.
+# Status 0 with "scrcpy started" is the discriminating pair — the 2s default
+# returns 43 for this same mock, so both are pinned by cases above and below.
 output=$(run_case delayed shorttimeout "$WIRELESS_DEVICES" \
   --serial 192.168.70.125:5555 --timeout 0.2 --args --no-audio)
 status=$?
-short_elapsed=$(( SECONDS - start ))
 [[ $status -eq 0 ]] || fail "a 0.2s grace period refused a healthy start (status $status)" "$output"
 [[ "$output" == *"scrcpy started"* ]] || fail "a short --timeout did not start scrcpy" "$output"
-[[ $short_elapsed -le 1 ]] ||
-  fail "--timeout 0.2 still waited ${short_elapsed}s; the grace period is not configurable" "$output"
 
 # A live PID in the launcher's PID file is a deliberate refusal.
 refuse_state=$(new_state_dir refuse)
@@ -458,6 +490,16 @@ status=$?
 [[ $status -eq 0 ]] || fail "the first launch of a session failed (status $status)" "$output"
 [[ -s "$TEST_DIR/scrcpy-refusea.pid" ]] || fail "the first launch started no scrcpy" "$output"
 running_pid=$(cat "$TEST_DIR/scrcpy-refusea.pid")
+# The mock is a `#!/usr/bin/env bash` script, so the kernel-set argv names an
+# interpreter before it names scrcpy. Pin that premise here: it is the reason a
+# fixed argv[0]-or-argv[1] window would be a regression rather than a
+# simplification, and without this check the refusal below would still "pass" on
+# a checker that never found the session at all — nothing to refuse, nothing to
+# replace, and the case green for the wrong reason.
+refuse_argv0=$(tr '\0' '\n' <"/proc/$running_pid/cmdline" 2>/dev/null | head -n 1)
+[[ -n "$refuse_argv0" ]] || fail "the first session's command line could not be read" "$output"
+[[ "${refuse_argv0##*/}" != "scrcpy" ]] ||
+  fail "the mock's identity is at argv[0]; this harness no longer covers a wrapped scrcpy" "$output"
 refuse_pid_file=$(launcher_pid_file "$refuse_state")
 [[ -f "$refuse_pid_file" ]] || fail "the launch wrote no PID file" "$output"
 [[ "$(cat "$refuse_pid_file")" == "$running_pid" ]] ||
@@ -519,6 +561,35 @@ if kill -0 "$stubborn_pid" 2>/dev/null; then
 fi
 stop_mock_scrcpy stubborn2
 
+# A process that stops being scrcpy while the launcher is waiting for it to
+# exit must not be SIGKILLed. This is the escalation path, one function away from
+# the identity gate that guards the first signal, and it is the one place a
+# SIGTERM-proof process can be confused with a recycled PID. The mock turns
+# itself into `sleep 300` in the same PID when signalled, so a launcher without
+# the recheck kills an innocent process and reports a clean --force; one with the
+# recheck refuses and hands the PID back to the user.
+shift_state=$(new_state_dir shift)
+output=$(CASE_STATE_HOME="$shift_state" run_case shape_shift shift "$WIRELESS_DEVICES" \
+  --serial 192.168.70.125:5555 --timeout 0.3 --args --no-audio)
+status=$?
+[[ $status -eq 0 ]] || fail "the launch of a shape-shifting session failed (status $status)" "$output"
+[[ -s "$TEST_DIR/scrcpy-shift.pid" ]] || fail "the shape-shifting session did not start" "$output"
+shift_pid=$(cat "$TEST_DIR/scrcpy-shift.pid")
+output=$(CASE_STATE_HOME="$shift_state" run_case running shift2 "$WIRELESS_DEVICES" \
+  --serial 192.168.70.125:5555 --force --timeout 0.3 --args --no-audio)
+status=$?
+[[ $status -eq 1 ]] ||
+  fail "--force reported success against a PID that stopped being scrcpy (status $status)" "$output"
+[[ "$output" == *"Could not stop the scrcpy session (PID: $shift_pid)"* ]] ||
+  fail "the failed --force does not name the PID it refused to kill" "$output"
+[[ "$output" == *"kill -9 $shift_pid"* ]] || fail "the failed --force gives no next step" "$output"
+[[ "$output" != *"scrcpy started"* ]] ||
+  fail "--force started a new session over a PID it could not stop" "$output"
+kill -0 "$shift_pid" 2>/dev/null ||
+  fail "the SIGKILL escalation killed a process that was no longer scrcpy" "$output"
+stop_mock_scrcpy shift
+stop_pid "$shift_pid"
+
 # A PID file whose process is gone is stale: it must not block a launch, and it
 # must be overwritten.
 stale_state=$(new_state_dir stale)
@@ -575,6 +646,63 @@ status=$?
 kill -0 "$foreign_pid" 2>/dev/null || fail "--force killed an unrelated process" "$output"
 stop_mock_scrcpy foreignf
 stop_pid "$foreign_pid"
+
+# A live process whose command line *mentions* scrcpy without being scrcpy: argv[0]
+# is an unrelated real program and "scrcpy" is only an argument, exactly like
+# `find / -name scrcpy` or `vim scrcpy`. The identity check used to search every
+# argv field, so this was positively identified as a live session and --force
+# SIGTERMed and then SIGKILLed it. `yes` needs no mock, takes the argument
+# without complaint, and stays alive for the length of the case.
+mention_state=$(new_state_dir mention)
+yes scrcpy >/dev/null 2>&1 &
+mention_pid=$!
+# Registered under the pid-file glob the EXIT trap reaps, so a failing assertion
+# here cannot orphan it either.
+printf '%s\n' "$mention_pid" >"$TEST_DIR/scrcpy-mentionhold.pid"
+kill -0 "$mention_pid" 2>/dev/null || fail "the stand-in process did not start"
+# Pin the premise rather than trust it: scrcpy must really be a non-leading argv
+# entry, or this case would stop testing the walk and start testing liveness.
+# A forked background job still shows its parent's command line until execve
+# completes, so read with a short retry rather than racing the exec — the
+# launcher's own identity reads never race, because they happen at least one
+# grace period after the PID was recorded.
+parent_cmdline=$(tr '\0' ' ' <"/proc/$$/cmdline" 2>/dev/null)
+mention_argv=""
+for _try in 1 2 3 4 5 6 7 8 9 10; do
+  mention_argv=$(tr '\0' ' ' <"/proc/$mention_pid/cmdline" 2>/dev/null)
+  [[ -n "$mention_argv" && "$mention_argv" != "$parent_cmdline" ]] && break
+  sleep 0.1
+done
+case "$mention_argv" in
+  yes\ scrcpy*) : ;;
+  *) fail "the stand-in does not have scrcpy as a non-leading argv entry" "$mention_argv" ;;
+esac
+seed_launcher_pid_file "$mention_state" "$mention_pid"
+output=$(CASE_STATE_HOME="$mention_state" run_case running mention "$WIRELESS_DEVICES" \
+  --serial 192.168.70.125:5555 --timeout 0.3 --args --no-audio)
+status=$?
+[[ $status -eq 0 ]] || fail "a PID file naming scrcpy as an argument blocked the launch (status $status)" "$output"
+[[ "$output" != *"already running"* ]] ||
+  fail "a process that merely mentions scrcpy was reported as a scrcpy session" "$output"
+[[ "$output" == *"scrcpy started"* ]] ||
+  fail "the launch over a scrcpy-mentioning PID file did not start" "$output"
+kill -0 "$mention_pid" 2>/dev/null ||
+  fail "the launch signalled a process that only mentions scrcpy" "$output"
+stop_mock_scrcpy mention
+
+# --force must not escalate to signals on it either.
+seed_launcher_pid_file "$mention_state" "$mention_pid"
+output=$(CASE_STATE_HOME="$mention_state" run_case running mentionf "$WIRELESS_DEVICES" \
+  --serial 192.168.70.125:5555 --force --timeout 0.3 --args --no-audio)
+status=$?
+[[ $status -eq 0 ]] || fail "--force refused over a PID that only mentions scrcpy (status $status)" "$output"
+[[ "$output" != *"--force given"* ]] ||
+  fail "--force claimed to stop a process whose executable is not scrcpy" "$output"
+[[ "$output" == *"scrcpy started"* ]] || fail "--force did not start a new session" "$output"
+kill -0 "$mention_pid" 2>/dev/null ||
+  fail "--force killed a process that only mentions scrcpy" "$output"
+stop_mock_scrcpy mentionf
+stop_pid "$mention_pid"
 
 # --wait hands scrcpy's own status back and takes the PID file with it. The
 # seeded PID file proves the file was written and then removed, rather than
@@ -659,6 +787,66 @@ status=$?
   fail "an unwritable state directory was misreported as a scrcpy failure" "$output"
 [[ ! -e "$TEST_DIR/scrcpy-blocked.pid" ]] || fail "an unwritable state directory still started scrcpy" "$output"
 
+# A state directory where the log can be created but the PID file cannot be
+# written must be reported as itself. Both writes sit inside functions main calls
+# as `||` operands, and bash suspends errexit across the whole dynamic extent of
+# such a function, so neither one was protected by `set -e` — the launcher
+# printed "[✓] scrcpy started" and a PID path with no PID file behind it.
+# /dev/full arranges exactly that, uid-independently: it opens, then every write
+# fails with ENOSPC, so mktemp still succeeds and only the PID write breaks. A
+# chmod would not survive a root run, and a directory at scrcpy.pid would fail
+# earlier in the `[[ -s ]]`/read path for a different reason entirely.
+if [[ -c /dev/full ]] && : >/dev/full 2>/dev/null; then
+  pidfail_state=$(new_state_dir pidfail)
+  mkdir -p "$pidfail_state/adb-wireless-connect"
+  ln -s /dev/full "$pidfail_state/adb-wireless-connect/scrcpy.pid"
+  output=$(CASE_STATE_HOME="$pidfail_state" run_case running pidfail "$WIRELESS_DEVICES" \
+    --serial 192.168.70.125:5555 --timeout 0.3 --args --no-audio)
+  status=$?
+  [[ $status -eq 1 ]] || fail "a failed PID-file write returned $status; expected 1" "$output"
+  [[ "$output" == *"Could not write the PID file"* ]] ||
+    fail "a failed PID-file write was not reported" "$output"
+  [[ "$output" == *"ls -ld"* ]] || fail "the failed PID-write message gives no next step" "$output"
+  [[ "$output" != *"scrcpy started"* ]] ||
+    fail "a launch whose PID file could not be written reported success" "$output"
+  # The success line's own shape, newline-anchored: the failure message names the
+  # path too, but never in the launcher's "    PID file: <path>" form.
+  [[ "$output" != *$'\n'"    PID file: "* ]] ||
+    fail "a failed PID write still printed the success line's PID file path" "$output"
+  # A session the launcher cannot record is stopped rather than left invisible.
+  # The mock may not have reached its own PID file before the signal, so this
+  # only asserts when there is something to assert about.
+  if [[ -s "$TEST_DIR/scrcpy-pidfail.pid" ]]; then
+    wait_for_pid_gone "$(cat "$TEST_DIR/scrcpy-pidfail.pid")" ||
+      fail "a launch that could not record its PID left scrcpy running" "$output"
+  fi
+  stop_mock_scrcpy pidfail
+
+  # The same write in --wait mode, reached through _launch_and_wait, which is
+  # called as `_launch_and_wait … || return $?` and is therefore just as
+  # errexit-free. Unguarded it would not even report a failure: the launcher
+  # would block on a session it can never record, and only the harness's 3s
+  # timeout would end the run.
+  pidfailwait_state=$(new_state_dir pidfailwait)
+  mkdir -p "$pidfailwait_state/adb-wireless-connect"
+  ln -s /dev/full "$pidfailwait_state/adb-wireless-connect/scrcpy.pid"
+  output=$(CASE_STATE_HOME="$pidfailwait_state" run_case running pidfailwait "$WIRELESS_DEVICES" \
+    --serial 192.168.70.125:5555 --wait --args --no-audio)
+  status=$?
+  [[ $status -eq 1 ]] || fail "a failed PID-file write in --wait mode returned $status; expected 1" "$output"
+  [[ "$output" == *"Could not write the PID file"* ]] ||
+    fail "a failed PID-file write in --wait mode was not reported" "$output"
+  [[ "$output" != *"scrcpy exited"* ]] ||
+    fail "--wait reported a session exit for a session it never recorded" "$output"
+  if [[ -s "$TEST_DIR/scrcpy-pidfailwait.pid" ]]; then
+    wait_for_pid_gone "$(cat "$TEST_DIR/scrcpy-pidfailwait.pid")" ||
+      fail "--wait left scrcpy running after failing to record its PID" "$output"
+  fi
+  stop_mock_scrcpy pidfailwait
+else
+  echo "SKIP: failed PID-file write cases need /dev/full"
+fi
+
 # A zero-padded answer at the device picker (08) must not be read as an invalid
 # octal number. The picker reads /dev/tty, so this case needs a real pty; util-
 # linux `script` is the cheapest way to get one.
@@ -669,11 +857,13 @@ if command -v script >/dev/null; then
     picker_devices="$picker_devices
 192.168.70.$i:5555    device"
   done
-  picker_cmd="env HOME=$TEST_DIR/home XDG_STATE_HOME=$picker_state PATH=$TEST_DIR/bin:$PATH"
-  picker_cmd="$picker_cmd MOCK_SCRCPY_MODE=running MOCK_SCRCPY_PID_FILE=$TEST_DIR/scrcpy-picker.pid"
-  # Quoted so the multi-line device list survives as one argument.
-  picker_cmd="$picker_cmd MOCK_ADB_DEVICES='$picker_devices'"
-  picker_cmd="$picker_cmd timeout 3s bash $ROOT_DIR/scrcpy.sh --args --no-audio --timeout 0.3"
+  # Built with printf -q, like tests/test_start_stop.sh's pty helper: the device
+  # list is multi-line and %q is what survives it as one argument. Raw
+  # single-quote interpolation happened to work only because no mock device list
+  # contains a quote.
+  printf -v picker_cmd 'env HOME=%q XDG_STATE_HOME=%q PATH=%q MOCK_SCRCPY_MODE=%q MOCK_SCRCPY_PID_FILE=%q MOCK_ADB_DEVICES=%q timeout 3s bash %q --args --no-audio --timeout 0.3' \
+    "$TEST_DIR/home" "$picker_state" "$TEST_DIR/bin:$PATH" running \
+    "$TEST_DIR/scrcpy-picker.pid" "$picker_devices" "$ROOT_DIR/scrcpy.sh"
   output=$(printf '08\n' | script -qec "$picker_cmd" /dev/null 2>&1)
   status=$?
   [[ $status -eq 0 ]] || fail "a zero-padded device choice killed the launcher (status $status)" "$output"

@@ -149,7 +149,18 @@ If it names a live scrcpy, a second launch refuses and prints both the running
 PID and the `kill` command to use. A PID file that does not positively identify
 a running scrcpy (killed launcher, reboot, recycled PID) is treated as stale:
 it is overwritten, and never blocks a launch or signals a stranger's process.
-`--force` escalates from `SIGTERM` to `SIGKILL` after about a second.
+Identification is positional — the command line has to *be* scrcpy, reached by
+stepping over any interpreter in front of it (`env bash …/scrcpy`). A process
+that merely mentions scrcpy as an argument, such as `find / -name scrcpy` or
+`vim scrcpy`, is not a session and is never signalled. `--force` escalates from
+`SIGTERM` to `SIGKILL` after about a second, re-checking identity before the
+`SIGKILL`: if the PID is no longer scrcpy by then, the launch stops and hands
+the PID back to you instead of killing whatever holds it.
+
+`stop.sh` disconnects ADB targets; it does **not** stop a scrcpy session. The two
+are independent, so tearing down your ADB connection leaves the mirroring window
+running. Stop it yourself with the `kill <pid>` printed on launch, or from the
+PID file above.
 
 The log directory is the same `adb-wireless-connect` directory, and holds one
 `scrcpy.*.log` per launch alongside `scrcpy.pid`. Pruning keeps the newest 10
