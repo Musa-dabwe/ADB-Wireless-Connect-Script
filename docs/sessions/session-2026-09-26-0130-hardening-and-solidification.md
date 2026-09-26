@@ -302,21 +302,35 @@ every item traced to a specific function in a specific script.
   - File: stop.sh
   - Status: PENDING
 - **Bug HS-023**: the two post-connect `adb devices` dumps in `start.sh` have no
-  error handling.
-  - Root cause: `start.sh:294` and `start.sh:302` are unguarded, so a failing
-    `adb devices` exits under `set -e` with no script-authored message. The one
-    at `start.sh:302` is the sharper: a failure there kills the script *before*
-    the `if` on the next line can print its "Device not showing as connected
-    wirelessly" diagnostic.
+  error handling — but they are not the same severity, and the first version of
+  this record said they were.
+  - Root cause: both calls are unguarded. `start.sh:294`, in
+    `step_verify_wireless`, is **fatal**: that function is called as a plain
+    statement at `start.sh:324` and `start.sh:334`, so a failing `adb devices`
+    exits the script with only adb's own stderr. `start.sh:302`, in
+    `step_disconnect_usb_prompt`, is **cosmetic only**: the function has one call
+    site, `if ! step_disconnect_usb_prompt` at `start.sh:325`, and bash suspends
+    `errexit` across the whole dynamic extent of a function invoked in a negated
+    condition. A failure there prints adb's raw stderr and execution continues to
+    the `if` on the next line, which still prints "Device not showing as
+    connected wirelessly. Check the IP and try again." and returns 1 normally.
+    Verified end to end against a mock adb that fails only that call: rc=1 via
+    the ordinary `return 1` path, and the friendly diagnostic still appears.
   - Fix applied: **none — out of scope for a documentation task.** Also found
     while documenting, not while hardening.
   - File: start.sh
   - Status: PENDING
 
-Between them, HS-021, HS-022, and HS-023 are the only unguarded adb invocations
-left in the three scripts — seven calls in five places, since each `stop.sh`
-branch makes two. Every other adb call is guarded by `if !`, by `|| true`, or by
-sitting inside an `if` condition.
+Between them, HS-021, HS-022, and HS-023 are the only adb invocations in the
+three scripts that get no explicit guard — seven calls in five places, since each
+`stop.sh` branch makes two. **Six are fatal; `start.sh:302` is cosmetic**, for
+the reason given in HS-023. Every other adb call is guarded by one of four
+mechanisms: `if !` around the call (`stop.sh:80`, `stop.sh:112`); `|| true`
+(`start.sh:141`, `start.sh:189`, `start.sh:262`, `start.sh:318`, `stop.sh:124`);
+sitting inside an `if` condition (`start.sh:303`); or being a non-final element
+of a pipeline, so the pipeline's status is the last command's rather than adb's
+(`start.sh:100`, `scrcpy.sh:190`, `scrcpy.sh:195`, and `start.sh:189` again as
+belt-and-braces).
 
 ## Testing Performed
 - **Unit Tests**: `bash tests/test_scrcpy_launcher.sh` — PASS, 4 case groups,
