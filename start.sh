@@ -8,6 +8,34 @@ NC='\033[0m'
 
 PORT=5555
 
+# Strip zero padding from a user-supplied whole number. Bash arithmetic reads
+# "08" as an invalid octal number and, under set -e, aborts the script with no
+# message, so every number this script handles is normalized in one place first.
+# A value with no numeric form is passed through untouched so the caller's own
+# validation stays in charge.
+_normalize_number() {
+  local value=$1
+  [[ "$value" =~ ^[0-9]+$ ]] || { printf '%s\n' "$value"; return 0; }
+  while [[ ${#value} -gt 1 && "${value:0:1}" == "0" ]]; do
+    value="${value:1}"
+  done
+  printf '%s\n' "$value"
+}
+
+# The single port check, shared by both ways of setting PORT (the --port flag and
+# the Android 11+ pairing prompt) so the two input paths cannot drift. Prints the
+# normalized port and returns 0, or returns 1 without printing on rejection.
+# The length test comes first on purpose: bash arithmetic is 64-bit and wraps, so
+# 18446744073709557171 (2^64 + 5555) compares as 5555 and would slip through a
+# range check alone.
+_valid_port() {
+  local value
+  value=$(_normalize_number "$1")
+  [[ "$value" =~ ^[0-9]{1,5}$ ]] || return 1
+  (( value >= 1024 && value <= 65535 )) || return 1
+  printf '%s\n' "$value"
+}
+
 show_help() {
   echo -e "${CYAN}ADB Wireless Connect - start.sh${NC}"
   echo ""
@@ -23,19 +51,27 @@ show_help() {
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     -p|--port)
-      if [[ -z "$2" || "$2" =~ ^- ]]; then
+      _port_arg="${2:-}"
+      if [[ -z "$_port_arg" || "$_port_arg" =~ ^- ]]; then
         echo -e "${YELLOW}[!] Option $1 requires a port argument.${NC}"
         show_help
         exit 1
       fi
-      PORT="$2"; shift 2 ;;
+      # Validate here instead of letting "adb connect <junk>" fail later with
+      # adb's own terse error, and so the message can name the bad value.
+      if ! _port_norm=$(_valid_port "$_port_arg"); then
+        echo -e "${YELLOW}[!] Invalid port: $_port_arg (must be a number between 1024 and 65535).${NC}"
+        show_help
+        exit 1
+      fi
+      PORT="$_port_norm"; shift 2 ;;
     -h|--help) show_help; exit 0 ;;
     *) echo -e "${YELLOW}[!] Unknown option: $1${NC}"; show_help; exit 1 ;;
   esac
 done
 
 print_banner() {
-  clear 2>/dev/null || true
+  echo ""
   echo -e "${CYAN}"
   echo "  ╔══════════════════════════════════════════════╗"
   echo "  ║        ADB Wireless Connect Script           ║"
@@ -49,9 +85,9 @@ check_adb() {
     echo -e "${YELLOW}[!] adb not found on this system.${NC}"
     echo ""
     echo "  Install ADB:"
-    echo "    sudo apt install adb              # Debian/Ubuntu/Pop!_OS"
-    echo "    sudo dnf install android-tools    # Fedora"
-    echo "    sudo pacman -S android-tools      # Arch"
+    echo "    pkexec apt install adb             # Debian/Ubuntu/Pop!_OS"
+    echo "    pkexec dnf install android-tools   # Fedora"
+    echo "    pkexec pacman -S android-tools     # Arch"
     echo ""
     echo -e "${YELLOW}  After installing, re-run this script.${NC}"
     exit 1
@@ -75,9 +111,17 @@ detect_usb_device() {
     for i in "${!devices[@]}"; do
       echo "    $((i+1))) ${devices[$i]}"
     done
-    read -rp "  Select device number [1-${#devices[@]}]: " choice </dev/tty || choice=1
+    read -rp "  Select device number [1-${#devices[@]}, default: 1]: " choice </dev/tty || choice=1
+    # Guard the index, not just the shape. Unvalidated input yields idx=-1, and
+    # bash resolves a negative subscript to the LAST device — so garbage here
+    # silently connects to the wrong phone rather than failing. Non-integer
+    # input is worse: it dies inside arithmetic under set -e with a bare bash
+    # error and no script message at all.
+    choice=$(_normalize_number "$choice")
+    [[ "$choice" =~ ^[0-9]+$ ]] || choice=1
     local idx=$((choice-1))
-    DEVICE_ID="${devices[$idx]:-${devices[0]}}"
+    [[ $idx -ge 0 && $idx -lt ${#devices[@]} ]] || idx=0
+    DEVICE_ID="${devices[$idx]}"
     echo -e "${GREEN}[✓] Selected device: $DEVICE_ID${NC}"
     return 0
   fi
@@ -102,9 +146,19 @@ handle_android11_pairing() {
     fi
     echo -e "${GREEN}[✓] Pairing successful!${NC}"
     echo ""
-    read -rp "  Enter target Connect Port shown on main Wireless Debugging page [default: $PORT]: " target_port </dev/tty || target_port="$PORT"
+    # This prompt is the second way of setting PORT, so it gets the same check
+    # as --port; an empty answer keeps the already-validated $PORT. Without it a
+    # typo here reaches "adb connect <ip>:<junk>" and burns two attempts before
+    # step_connect reports the failure.
+    read -rp "  Enter target Connect Port shown on main Wireless Debugging page [default: $PORT]: " target_port </dev/tty || target_port=""
+    if [[ -n "$target_port" ]]; then
+      if ! _prompt_port=$(_valid_port "$target_port"); then
+        echo -e "${YELLOW}[!] Invalid port: $target_port (must be a number between 1024 and 65535).${NC}"
+        exit 1
+      fi
+      PORT="$_prompt_port"
+    fi
     DEVICE_IP="${pair_addr%%:*}"
-    PORT="${target_port:-$PORT}"
   else
     echo -e "${YELLOW}[!] Pairing details missing. Exiting.${NC}"
     exit 1
@@ -218,7 +272,19 @@ step_connect() {
   if ! _try_connect; then
     echo -e "${YELLOW}[!] Connection failed. Retrying in 3 seconds...${NC}"
     sleep 3
-    _try_connect
+    if ! _try_connect; then
+      # Without this the second failure returns non-zero and set -e kills the
+      # script right after the "Retrying" line, with nothing on screen.
+      echo -e "${YELLOW}[!] Could not connect to $DEVICE_IP:$PORT after 2 attempts.${NC}"
+      echo ""
+      echo "  Usual causes:"
+      echo "    • This PC and the phone are on different networks."
+      echo "    • Wireless debugging is off on the phone."
+      echo "    • A stale adb server still holds an old connection."
+      echo ""
+      echo "  Try: adb kill-server && adb start-server, then re-run this script."
+      exit 1
+    fi
   fi
 }
 
@@ -234,7 +300,7 @@ step_disconnect_usb_prompt() {
   echo ""
   echo -e "${YELLOW}[*] Verifying wireless connection...${NC}"
   adb devices
-  if adb devices | awk 'NR>1' | grep -q "$DEVICE_IP:$PORT"; then
+  if adb devices | awk 'NR>1' | grep -Fq -- "$DEVICE_IP:$PORT"; then
     echo ""
     echo -e "${GREEN}  ✓ Connected wirelessly!${NC}"
     return 0
