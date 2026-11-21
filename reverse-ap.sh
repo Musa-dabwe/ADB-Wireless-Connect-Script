@@ -66,6 +66,7 @@ Commands:
   status                    Show AP, clients, leases and adb state
   pair PORT CODE            Pair adb using the phone's DHCP IP and pairing port
   pair-qr IMAGE_FILE        Pair adb by scanning a QR code image (from "Pair with QR code")
+  pair-qr-cam [DEVICE]      Pair adb by scanning QR code from laptop camera
   connect [PORT]            Connect adb (PORT omitted: use mDNS discovery)
   internet SSID [PASSWORD]  Also join a hotspot for internet, keeping the AP up
 
@@ -82,6 +83,8 @@ Examples:
   ./reverse-ap.sh start
   ./reverse-ap.sh pair 37357 671790
   ./reverse-ap.sh pair-qr ~/Pictures/qr.png
+  ./reverse-ap.sh pair-qr-cam
+  ./reverse-ap.sh pair-qr-cam /dev/video0
   ./reverse-ap.sh connect
   ./reverse-ap.sh internet "Oppo 1"
   ./reverse-ap.sh stop
@@ -448,19 +451,17 @@ cmd_pair_qr() {
   [[ -n "$image_file" ]] || die "Usage: ./reverse-ap.sh pair-qr <image-file>"
   [[ -f "$image_file" ]] || die "File not found: $image_file"
 
+  _scan_and_pair_from_image "$image_file"
+}
+
+_scan_qr_from_image() {
+  local image_file="$1"
   command -v zbarimg >/dev/null 2>&1 || die "zbarimg not found. Install: pkexec pacman -S zbar (Arch) / pkexec apt install zbar-tools (Debian)"
+  zbarimg --quiet "$image_file" 2>/dev/null | head -1 | sed 's/^[^:]*: *//'
+}
 
-  log "Scanning QR code from $image_file ..."
-  local qr_data
-  qr_data=$(zbarimg --quiet "$image_file" 2>/dev/null | head -1 | sed 's/^[^:]*: *//')
-  [[ -n "$qr_data" ]] || die "No QR code found in image"
-
-  log "QR data: $qr_data"
-
-  # Parse common QR code formats from Android Wireless Debugging:
-  # Format 1: adb://<code>@<ip>:<port>
-  # Format 2: WIFI:T:ADB;S:<ssid>;P:<password>;; (less common for pairing)
-  # Format 3: Just the pairing string "ip:port:code"
+_parse_qr_data() {
+  local qr_data="$1"
   local ip port code
 
   if [[ "$qr_data" =~ ^adb://([^@]+)@([^:]+):([0-9]+)$ ]]; then
@@ -472,11 +473,15 @@ cmd_pair_qr() {
     port="${BASH_REMATCH[2]}"
     code="${BASH_REMATCH[3]}"
   elif [[ "$qr_data" == "WIFI:T:ADB;S:"* ]]; then
-    # WIFI config format - would need different handling
     die "WIFI config QR format not supported for pairing. Use 'Pair device with pairing code' QR instead."
   else
     die "Unrecognized QR code format: $qr_data"
   fi
+  printf '%s\n%s\n%s\n' "$ip" "$port" "$code"
+}
+
+_pair_with_parsed_qr() {
+  local ip="$1" port="$2" code="$3"
 
   # Use DHCP lease IP instead of the IP in QR (which is often cellular)
   local lease_ip
@@ -492,6 +497,79 @@ cmd_pair_qr() {
     die "Pairing failed. Check that Wireless debugging is on and the QR code is fresh."
   fi
   ok "Paired via QR code. Now run: ./reverse-ap.sh connect"
+}
+
+_scan_and_pair_from_image() {
+  local image_file="$1"
+  log "Scanning QR code from $image_file ..."
+  local qr_data
+  qr_data=$(_scan_qr_from_image "$image_file")
+  [[ -n "$qr_data" ]] || die "No QR code found in image"
+  log "QR data: $qr_data"
+
+  local parsed
+  parsed=$(_parse_qr_data "$qr_data")
+  local ip port code
+  ip=$(echo "$parsed" | sed -n '1p')
+  port=$(echo "$parsed" | sed -n '2p')
+  code=$(echo "$parsed" | sed -n '3p')
+
+  _pair_with_parsed_qr "$ip" "$port" "$code"
+}
+
+cmd_pair_qr_cam() {
+  local device="${POSITIONAL[0]:-}"
+  local max_attempts=10
+  local attempt=1
+
+  command -v ffmpeg >/dev/null 2>&1 || die "ffmpeg not found for camera capture"
+  command -v zbarimg >/dev/null 2>&1 || die "zbarimg not found. Install: pkexec pacman -S zbar (Arch) / pkexec apt install zbar-tools (Debian)"
+
+  # Auto-detect video device if not specified
+  if [[ -z "$device" ]]; then
+    device=$(v4l2-ctl --list-devices 2>/dev/null | awk '/video[0-9]+/{print $NF; exit}')
+    [[ -n "$device" ]] || die "No video device found. Specify with: ./reverse-ap.sh pair-qr-cam /dev/video0"
+    log "Auto-detected camera: $device"
+  fi
+  [[ -e "$device" ]] || die "Video device not found: $device"
+
+  echo -e "${CYAN}Point your phone's QR code at the camera. Press Ctrl+C to cancel.${NC}"
+  echo ""
+
+  local temp_img="/tmp/adb_qr_cam_$$.png"
+
+  while (( attempt <= max_attempts )); do
+    log "Attempt $attempt/$max_attempts: capturing frame from $device ..."
+    
+    # Capture a single frame
+    if ffmpeg -loglevel error -f v4l2 -i "$device" -vframes 1 -y "$temp_img" 2>/dev/null; then
+      local qr_data
+      qr_data=$(_scan_qr_from_image "$temp_img")
+      
+      if [[ -n "$qr_data" ]]; then
+        log "QR data: $qr_data"
+        local parsed
+        parsed=$(_parse_qr_data "$qr_data")
+        local ip port code
+        ip=$(echo "$parsed" | sed -n '1p')
+        port=$(echo "$parsed" | sed -n '2p')
+        code=$(echo "$parsed" | sed -n '3p')
+        rm -f "$temp_img"
+        _pair_with_parsed_qr "$ip" "$port" "$code"
+        return 0
+      else
+        warn "No QR code detected in frame"
+      fi
+    else
+      warn "Failed to capture frame from camera"
+    fi
+
+    ((attempt++))
+    [[ $attempt -le $max_attempts ]] && sleep 1
+  done
+
+  rm -f "$temp_img"
+  die "QR code not detected after $max_attempts attempts. Make sure the QR code is visible and well-lit."
 }
 
 cmd_connect() {
@@ -580,13 +658,14 @@ cmd_internet() {
 }
 
 case "$CMD" in
-  start)      cmd_start ;;
-  stop)       cmd_stop ;;
-  status)     cmd_status ;;
-  pair)       cmd_pair ;;
-  pair-qr)    cmd_pair_qr ;;
-  connect)    cmd_connect ;;
-  internet)   cmd_internet ;;
+  start)        cmd_start ;;
+  stop)         cmd_stop ;;
+  status)       cmd_status ;;
+  pair)         cmd_pair ;;
+  pair-qr)      cmd_pair_qr ;;
+  pair-qr-cam)  cmd_pair_qr_cam ;;
+  connect)      cmd_connect ;;
+  internet)     cmd_internet ;;
   help|-h|--help) usage ;;
   *) die "Unknown command: $CMD (try --help)" ;;
 esac
