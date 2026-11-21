@@ -65,6 +65,7 @@ Commands:
   stop                      Tear the AP down and give the Wi-Fi back to NM
   status                    Show AP, clients, leases and adb state
   pair PORT CODE            Pair adb using the phone's DHCP IP and pairing port
+  pair-qr IMAGE_FILE        Pair adb by scanning a QR code image (from "Pair with QR code")
   connect [PORT]            Connect adb (PORT omitted: use mDNS discovery)
   internet SSID [PASSWORD]  Also join a hotspot for internet, keeping the AP up
 
@@ -80,6 +81,7 @@ Options:
 Examples:
   ./reverse-ap.sh start
   ./reverse-ap.sh pair 37357 671790
+  ./reverse-ap.sh pair-qr ~/Pictures/qr.png
   ./reverse-ap.sh connect
   ./reverse-ap.sh internet "Oppo 1"
   ./reverse-ap.sh stop
@@ -441,6 +443,57 @@ cmd_pair() {
   ok "Paired. Now run: ./reverse-ap.sh connect"
 }
 
+cmd_pair_qr() {
+  local image_file="${POSITIONAL[0]:-}"
+  [[ -n "$image_file" ]] || die "Usage: ./reverse-ap.sh pair-qr <image-file>"
+  [[ -f "$image_file" ]] || die "File not found: $image_file"
+
+  command -v zbarimg >/dev/null 2>&1 || die "zbarimg not found. Install: pkexec pacman -S zbar (Arch) / pkexec apt install zbar-tools (Debian)"
+
+  log "Scanning QR code from $image_file ..."
+  local qr_data
+  qr_data=$(zbarimg --quiet "$image_file" 2>/dev/null | head -1 | sed 's/^[^:]*: *//')
+  [[ -n "$qr_data" ]] || die "No QR code found in image"
+
+  log "QR data: $qr_data"
+
+  # Parse common QR code formats from Android Wireless Debugging:
+  # Format 1: adb://<code>@<ip>:<port>
+  # Format 2: WIFI:T:ADB;S:<ssid>;P:<password>;; (less common for pairing)
+  # Format 3: Just the pairing string "ip:port:code"
+  local ip port code
+
+  if [[ "$qr_data" =~ ^adb://([^@]+)@([^:]+):([0-9]+)$ ]]; then
+    code="${BASH_REMATCH[1]}"
+    ip="${BASH_REMATCH[2]}"
+    port="${BASH_REMATCH[3]}"
+  elif [[ "$qr_data" =~ ^([^:]+):([0-9]+):([0-9]{6})$ ]]; then
+    ip="${BASH_REMATCH[1]}"
+    port="${BASH_REMATCH[2]}"
+    code="${BASH_REMATCH[3]}"
+  elif [[ "$qr_data" == "WIFI:T:ADB;S:"* ]]; then
+    # WIFI config format - would need different handling
+    die "WIFI config QR format not supported for pairing. Use 'Pair device with pairing code' QR instead."
+  else
+    die "Unrecognized QR code format: $qr_data"
+  fi
+
+  # Use DHCP lease IP instead of the IP in QR (which is often cellular)
+  local lease_ip
+  lease_ip=$(first_lease_ip) || die "No DHCP lease found — is the phone connected to the AP?"
+  warn "QR code contains IP $ip; using DHCP lease IP instead: $lease_ip"
+  ip="$lease_ip"
+
+  log "Pairing $ip:$port with code $code ..."
+  local out
+  out=$(timeout 30 adb pair "$ip:$port" "$code" 2>&1 || true)
+  echo "    $out"
+  if ! echo "$out" | grep -qi "successfully paired"; then
+    die "Pairing failed. Check that Wireless debugging is on and the QR code is fresh."
+  fi
+  ok "Paired via QR code. Now run: ./reverse-ap.sh connect"
+}
+
 cmd_connect() {
   local port="${POSITIONAL[0]:-}"
   local ip addr
@@ -527,12 +580,13 @@ cmd_internet() {
 }
 
 case "$CMD" in
-  start)    cmd_start ;;
-  stop)     cmd_stop ;;
-  status)   cmd_status ;;
-  pair)     cmd_pair ;;
-  connect)  cmd_connect ;;
-  internet) cmd_internet ;;
+  start)      cmd_start ;;
+  stop)       cmd_stop ;;
+  status)     cmd_status ;;
+  pair)       cmd_pair ;;
+  pair-qr)    cmd_pair_qr ;;
+  connect)    cmd_connect ;;
+  internet)   cmd_internet ;;
   help|-h|--help) usage ;;
   *) die "Unknown command: $CMD (try --help)" ;;
 esac
