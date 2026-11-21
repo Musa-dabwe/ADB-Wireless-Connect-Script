@@ -236,7 +236,9 @@ When the phone provides the Wi-Fi hotspot and no USB cable is available, wireles
 
 On the phone: join the printed SSID (default `adbnet`), enable **Wireless debugging**, then either:
 - Tap **Pair device with pairing code** and note the port + 6-digit code, OR
-- Tap **Pair device with QR code** and save the QR code image
+- Tap **Pair device with QR code** and either:
+  - Save the QR code image, OR
+  - Hold the phone's QR code up to your laptop's camera
 
 ```bash
 # Manual pairing
@@ -244,6 +246,9 @@ On the phone: join the printed SSID (default `adbnet`), enable **Wireless debugg
 
 # Or scan QR code image (PNG/JPG)
 ./reverse-ap.sh pair-qr ~/Pictures/pairing_qr.png
+
+# Or scan directly from laptop camera
+./reverse-ap.sh pair-qr-cam
 
 # Then connect
 ./reverse-ap.sh connect
@@ -273,6 +278,7 @@ Commands:
   status                    Show AP, clients, leases and adb state
   pair PORT CODE            Pair adb using the phone's DHCP IP and pairing port
   pair-qr IMAGE_FILE        Pair adb by scanning a QR code image (from "Pair with QR code")
+  pair-qr-cam [DEVICE]      Pair adb by scanning QR code from laptop camera
   connect [PORT]            Connect adb (PORT omitted: use mDNS discovery)
   internet SSID [PASSWORD]  Also join a hotspot for internet, keeping the AP up
 
@@ -299,13 +305,14 @@ Options:
 **Dependencies** (in addition to `adb`):
 - `hostapd`, `dnsmasq`, `iw`, `ip`, `nmcli`
 - `zbar` (for QR code pairing: `zbarimg`)
+- `ffmpeg` (for camera QR pairing: `pair-qr-cam`)
 
 ```bash
 # Arch
-pkexec pacman -S hostapd dnsmasq iw networkmanager android-tools zbar
+pkexec pacman -S hostapd dnsmasq iw networkmanager android-tools zbar ffmpeg
 
 # Debian / Ubuntu
-pkexec apt install hostapd dnsmasq iw network-manager adb zbar-tools
+pkexec apt install hostapd dnsmasq iw network-manager adb zbar-tools ffmpeg
 ```
 
 ---
